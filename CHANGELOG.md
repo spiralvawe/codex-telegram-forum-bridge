@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.1 — 2026-07-28
+
+- Normalize integer weekly-limit values before decimal formatting so the
+  bridge behaves consistently on every supported Python 3.10–3.13 runtime.
+
 ## 0.1.0 — 2026-07-28
 
 - Extracted the durable Codex↔Telegram bridge into a project-neutral package.

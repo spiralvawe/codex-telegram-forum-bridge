@@ -111,7 +111,7 @@ class CodexAppServer:
                     "clientInfo": {
                         "name": "codex_telegram_forum_bridge",
                         "title": "Codex Telegram Forum Bridge",
-                        "version": "0.1.0",
+                        "version": "0.1.1",
                     },
                     "capabilities": {"experimentalApi": True},
                 },

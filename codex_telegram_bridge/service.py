@@ -1307,7 +1307,10 @@ def weekly_codex_remaining_percent(
 
 
 def format_limit_percent(value: float) -> str:
-    rounded = round(value, 1)
+    # Python 3.10 preserves ``int`` for ``round(int, ndigits)`` while newer
+    # versions return a float. Normalize first so the formatting path behaves
+    # identically across every supported interpreter.
+    rounded = round(float(value), 1)
     if rounded.is_integer():
         return str(int(rounded))
     return f"{rounded:.1f}".replace(".", ",")

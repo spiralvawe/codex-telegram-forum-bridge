@@ -1,0 +1,138 @@
+from __future__ import annotations
+
+import plistlib
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+import installer  # noqa: E402
+from codex_telegram_bridge.config import BridgeConfig  # noqa: E402
+
+
+class PortableInstallerTests(unittest.TestCase):
+    def make_config(self, root: Path) -> BridgeConfig:
+        workspace = root / "workspace with spaces"
+        state = root / "state"
+        workspace.mkdir()
+        state.mkdir(mode=0o700)
+        config = BridgeConfig(
+            workspace=workspace,
+            state_dir=state,
+            instance_id="example-a1b2c3",
+            secret_backend="file",
+            secret_reference=str(state / "secrets" / "bot-token"),
+            codex_binary="/usr/local/bin/codex",
+            ffmpeg_binary="/usr/local/bin/ffmpeg",
+        )
+        installer.atomic_json(
+            installer.config_path(config),
+            config.as_file_payload(),
+        )
+        return config
+
+    def test_instance_validation_is_service_safe(self) -> None:
+        self.assertEqual("project-one", installer.validate_instance("Project One"))
+        with self.assertRaises(Exception):
+            installer.validate_instance("---")
+
+    def test_systemd_units_contain_no_bot_token(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            home = root / "home"
+            home.mkdir()
+            config = self.make_config(root)
+            with (
+                mock.patch.object(Path, "home", return_value=home),
+                mock.patch("installer.shutil.which", return_value="/bin/systemctl"),
+                mock.patch("installer.run") as invoke,
+            ):
+                services = installer.install_systemd(config)
+
+            unit_dir = home / ".config" / "systemd" / "user"
+            service_text = (unit_dir / services[0]).read_text(encoding="utf-8")
+            health_text = (
+                unit_dir
+                / "codex-telegram-bridge-example-a1b2c3-health.service"
+            ).read_text(encoding="utf-8")
+
+        self.assertIn("WorkingDirectory=", service_text)
+        self.assertIn("workspace with spaces", service_text)
+        self.assertIn("config.json", service_text)
+        self.assertNotIn("bot-token", service_text)
+        self.assertNotIn("bot-token", health_text)
+        self.assertGreaterEqual(invoke.call_count, 3)
+
+    def test_launchd_plists_are_generated_per_instance(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            home = root / "home"
+            home.mkdir()
+            config = self.make_config(root)
+            with (
+                mock.patch.object(Path, "home", return_value=home),
+                mock.patch("installer.shutil.which", return_value="/bin/launchctl"),
+                mock.patch("installer.run"),
+            ):
+                labels = installer.install_launchd(config)
+
+            plist_path = (
+                home / "Library" / "LaunchAgents" / f"{labels[0]}.plist"
+            )
+            with plist_path.open("rb") as stream:
+                payload = plistlib.load(stream)
+
+        self.assertEqual(labels[0], payload["Label"])
+        self.assertIn("config.json", " ".join(payload["ProgramArguments"]))
+        self.assertNotIn("bot-token", repr(payload))
+
+    def test_linux_deactivate_removes_services_but_retains_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            home = root / "home"
+            unit_dir = home / ".config" / "systemd" / "user"
+            unit_dir.mkdir(parents=True)
+            config = self.make_config(root)
+            names = (
+                "codex-telegram-bridge-example-a1b2c3.service",
+                "codex-telegram-bridge-example-a1b2c3-health.service",
+                "codex-telegram-bridge-example-a1b2c3-health.timer",
+            )
+            for name in names:
+                (unit_dir / name).write_text("test\n", encoding="utf-8")
+            args = mock.Mock(config=str(installer.config_path(config)))
+            with (
+                mock.patch.object(Path, "home", return_value=home),
+                mock.patch("installer.sys.platform", "linux"),
+                mock.patch("installer.run"),
+            ):
+                result = installer.deactivate(args)
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(
+                config.state_dir.resolve(),
+                Path(result["stateRetained"]).resolve(),
+            )
+            self.assertTrue(config.state_dir.is_dir())
+            self.assertTrue(all(not (unit_dir / name).exists() for name in names))
+
+    def test_codex_setup_contract_and_skill_are_present(self) -> None:
+        contract = (ROOT / "SETUP_WITH_CODEX.md").read_text(encoding="utf-8")
+        skill = (
+            ROOT
+            / "skills"
+            / "codex-telegram-bootstrap"
+            / "SKILL.md"
+        ).read_text(encoding="utf-8")
+        self.assertIn("Never ask the user to paste the bot token", contract)
+        self.assertIn("one new Telegram bot token", contract)
+        self.assertIn("SETUP_WITH_CODEX.md", skill)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,54 @@
+# Architecture
+
+```text
+Telegram private forum supergroup
+          ↕ Bot API
+portable Python bridge
+   ↙              ↘
+SQLite state      local media/ffmpeg
+   ↘              ↙
+owner-only Codex App Server socket
+          ↕
+Codex tasks with cwd == configured workspace
+```
+
+One bridge instance owns one bot update stream and one Telegram binding.
+Codex tasks are scoped by their exact canonical working directory because the
+App Server protocol does not expose a stable saved-project identifier.
+
+## Durable state
+
+SQLite records:
+
+- Telegram group/user binding;
+- Codex task ↔ Telegram Topic mappings;
+- queued Telegram input and local media references;
+- inbound update completion;
+- outbound message/media delivery reservations;
+- Topic-creation intents;
+- approval cards and decisions;
+- archive cards, restore tokens, and confirmed Topic deletion.
+
+Telegram does not provide idempotency keys for Topic creation, messages, or
+media uploads. The bridge therefore reserves side effects before network calls.
+Ambiguous outcomes are surfaced for reconciliation and are not blindly
+replayed.
+
+## Codex connection
+
+Both macOS and Linux use the Codex CLI-managed local App Server daemon and its
+owner-only Unix socket. A MacBook can additionally attach Codex Desktop to that
+same daemon, allowing Telegram and Desktop to observe the same live turns and
+approvals. A headless VPS simply has no Desktop peer.
+
+No Codex port is exposed on the LAN or public internet.
+
+## Platform layer
+
+The Python bridge is shared. Only service registration differs:
+
+- macOS: one long-lived LaunchAgent and one five-minute health LaunchAgent;
+- Linux: one systemd user service plus a health service/timer.
+
+Each instance has its own configuration, virtual environment, state directory,
+logs, database, and service names.

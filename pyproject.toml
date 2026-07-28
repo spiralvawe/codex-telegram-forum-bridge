@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "codex-telegram-forum-bridge"
+version = "0.1.0"
+description = "Mirror one local Codex workspace into Topics in a private Telegram forum supergroup."
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+  {name = "spiralvawe"},
+]
+dependencies = [
+  "websocket-client==1.9.0",
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: MacOS",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Topic :: Communications :: Chat",
+]
+
+[project.scripts]
+codex-telegram-bridge = "codex_telegram_bridge.cli:main"
+codex-telegram-bridge-installer = "installer:main"
+
+[tool.setuptools]
+packages = ["codex_telegram_bridge"]
+py-modules = ["installer"]
+include-package-data = true
+
+[tool.setuptools.package-data]
+codex_telegram_bridge = ["assets/*.png"]

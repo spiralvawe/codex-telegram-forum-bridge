@@ -1,0 +1,462 @@
+from __future__ import annotations
+
+import contextlib
+import os
+import re
+import shutil
+import stat
+import subprocess
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable
+
+from .input_types import LocalInput
+
+
+MEDIA_KEY_PATTERN = re.compile(r"[0-9a-f]{32}")
+DEFAULT_RETENTION_SECONDS = 30 * 24 * 60 * 60
+DEFAULT_STORAGE_LIMIT_BYTES = 512 * 1024 * 1024
+
+
+class MediaProcessingError(RuntimeError):
+    def __init__(self, kind: str):
+        super().__init__(kind)
+        self.kind = kind
+
+
+@dataclass(frozen=True)
+class PreparedMedia:
+    kind: str
+    duration_seconds: int
+    inputs: tuple[LocalInput, ...]
+
+    @property
+    def frame_count(self) -> int:
+        return sum(item.input_type == "localImage" for item in self.inputs)
+
+    @property
+    def has_audio(self) -> bool:
+        return any(item.input_type == "localAudio" for item in self.inputs)
+
+
+@dataclass(frozen=True)
+class MediaPruneResult:
+    removed_directories: int
+    retained_bytes: int
+
+
+def media_request_text(
+    prepared: PreparedMedia,
+    *,
+    user_text: str = "",
+) -> str:
+    duration = max(0, int(prepared.duration_seconds))
+    if prepared.kind == "voice":
+        body = (
+            f"🎙 Голосовое сообщение из Telegram ({duration} с). "
+            "Аудио приложено к этому запросу. Воспринимай речь как основной "
+            "текст пользователя и ответь по существу; отдельная расшифровка "
+            "нужна только если она полезна для ответа."
+        )
+    elif prepared.kind in {"video_note", "video"}:
+        audio_text = (
+            "аудиодорожка"
+            if prepared.has_audio
+            else "без доступной аудиодорожки"
+        )
+        if prepared.kind == "video_note":
+            prefix = "⭕ Видеосообщение-кружок"
+        else:
+            prefix = "🎬 Видео"
+        body = (
+            f"{prefix} из Telegram ({duration} с): {audio_text} и "
+            f"{prepared.frame_count} ключевых кадр(а) приложены в "
+            "хронологическом порядке. Считай речь основной формулировкой "
+            "запроса, а кадры — визуальным контекстом. Ответь по существу; "
+            "отдельная расшифровка или покадровое описание не нужны без "
+            "необходимости."
+        )
+    else:
+        raise ValueError("unsupported prepared media kind")
+    comment = user_text.strip()
+    if comment:
+        body += f"\n\nКомментарий пользователя: {comment}"
+    return body
+
+
+class MediaProcessor:
+    def __init__(
+        self,
+        *,
+        root: str | Path,
+        ffmpeg_binary: str | Path,
+        timeout_seconds: float = 120,
+        retention_seconds: int = DEFAULT_RETENTION_SECONDS,
+        storage_limit_bytes: int = DEFAULT_STORAGE_LIMIT_BYTES,
+    ) -> None:
+        self.root = Path(root).expanduser().resolve(strict=False)
+        self.ffmpeg_binary = Path(ffmpeg_binary).expanduser()
+        self.timeout_seconds = max(1.0, float(timeout_seconds))
+        self.retention_seconds = max(0, int(retention_seconds))
+        self.storage_limit_bytes = max(1, int(storage_limit_bytes))
+
+    def dependency_ready(self) -> bool:
+        try:
+            status = self.ffmpeg_binary.stat()
+        except OSError:
+            return False
+        return bool(
+            stat.S_ISREG(status.st_mode)
+            and os.access(self.ffmpeg_binary, os.X_OK)
+        )
+
+    def ensure_root(self) -> None:
+        if self.root.is_symlink():
+            raise MediaProcessingError("unsafe_storage")
+        self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        status = self.root.stat()
+        if not stat.S_ISDIR(status.st_mode) or status.st_uid != os.getuid():
+            raise MediaProcessingError("unsafe_storage")
+        os.chmod(self.root, 0o700)
+
+    def message_directory(self, media_key: str) -> Path:
+        if MEDIA_KEY_PATTERN.fullmatch(media_key) is None:
+            raise ValueError("invalid media key")
+        self.ensure_root()
+        directory = self.root / media_key
+        if directory.is_symlink():
+            raise MediaProcessingError("unsafe_storage")
+        directory.mkdir(mode=0o700, exist_ok=True)
+        status = directory.stat()
+        if not stat.S_ISDIR(status.st_mode) or status.st_uid != os.getuid():
+            raise MediaProcessingError("unsafe_storage")
+        os.chmod(directory, 0o700)
+        return directory
+
+    def source_path(self, media_key: str) -> Path:
+        return self.message_directory(media_key) / "source.bin"
+
+    def prepare_voice(
+        self,
+        *,
+        media_key: str,
+        source_path: str | Path,
+        duration_seconds: int,
+    ) -> PreparedMedia:
+        directory = self.message_directory(media_key)
+        source = self._validated_source(source_path, directory)
+        audio = directory / "audio.mp3"
+        if not self._usable_file(audio):
+            self._run_ffmpeg(
+                [
+                    "-i",
+                    str(source),
+                    "-vn",
+                    "-ac",
+                    "1",
+                    "-ar",
+                    "16000",
+                    "-c:a",
+                    "libmp3lame",
+                    "-b:a",
+                    "64k",
+                ],
+                audio,
+                error_kind="invalid_audio",
+            )
+        self._touch_directory(directory)
+        return PreparedMedia(
+            kind="voice",
+            duration_seconds=max(0, int(duration_seconds)),
+            inputs=(LocalInput("localAudio", str(audio.resolve())),),
+        )
+
+    def prepare_video_note(
+        self,
+        *,
+        media_key: str,
+        source_path: str | Path,
+        duration_seconds: int,
+    ) -> PreparedMedia:
+        return self._prepare_video(
+            kind="video_note",
+            media_key=media_key,
+            source_path=source_path,
+            duration_seconds=duration_seconds,
+        )
+
+    def prepare_video(
+        self,
+        *,
+        media_key: str,
+        source_path: str | Path,
+        duration_seconds: int,
+    ) -> PreparedMedia:
+        return self._prepare_video(
+            kind="video",
+            media_key=media_key,
+            source_path=source_path,
+            duration_seconds=duration_seconds,
+        )
+
+    def _prepare_video(
+        self,
+        *,
+        kind: str,
+        media_key: str,
+        source_path: str | Path,
+        duration_seconds: int,
+    ) -> PreparedMedia:
+        if kind not in {"video_note", "video"}:
+            raise ValueError("unsupported video kind")
+        directory = self.message_directory(media_key)
+        source = self._validated_source(source_path, directory)
+        duration = max(0, int(duration_seconds))
+        inputs: list[LocalInput] = []
+
+        audio = directory / "audio.mp3"
+        if self._usable_file(audio) or self._try_video_audio(source, audio):
+            inputs.append(LocalInput("localAudio", str(audio.resolve())))
+
+        positions = self._frame_positions(duration)
+        for index, position in enumerate(positions, start=1):
+            frame = directory / f"frame-{index:02d}.jpg"
+            if not self._usable_file(frame):
+                self._run_ffmpeg(
+                    [
+                        "-ss",
+                        f"{position:.3f}",
+                        "-i",
+                        str(source),
+                        "-frames:v",
+                        "1",
+                        "-an",
+                        "-vf",
+                        "scale='min(768,iw)':-2",
+                        "-q:v",
+                        "3",
+                    ],
+                    frame,
+                    error_kind="invalid_video",
+                )
+            inputs.append(
+                LocalInput(
+                    "localImage",
+                    str(frame.resolve()),
+                    detail="low",
+                )
+            )
+        if not any(item.input_type == "localImage" for item in inputs):
+            raise MediaProcessingError("invalid_video")
+        self._touch_directory(directory)
+        return PreparedMedia(
+            kind=kind,
+            duration_seconds=duration,
+            inputs=tuple(inputs),
+        )
+
+    def prune(
+        self,
+        *,
+        protected_paths: Iterable[str | Path] = (),
+        now: float | None = None,
+    ) -> MediaPruneResult:
+        if not self.root.exists():
+            return MediaPruneResult(removed_directories=0, retained_bytes=0)
+        self.ensure_root()
+        current_time = time.time() if now is None else float(now)
+        protected_directories = self._protected_directories(protected_paths)
+        candidates: list[tuple[float, Path, int]] = []
+        retained_bytes = 0
+        for child in self.root.iterdir():
+            if child.is_symlink() or not child.is_dir():
+                continue
+            if MEDIA_KEY_PATTERN.fullmatch(child.name) is None:
+                continue
+            size = self._directory_size(child)
+            retained_bytes += size
+            candidates.append((child.stat().st_mtime, child, size))
+
+        removed = 0
+        kept: list[tuple[float, Path, int]] = []
+        for modified, directory, size in sorted(candidates):
+            expired = current_time - modified >= self.retention_seconds
+            if expired and directory not in protected_directories:
+                self._remove_directory(directory)
+                retained_bytes -= size
+                removed += 1
+            else:
+                kept.append((modified, directory, size))
+
+        if retained_bytes > self.storage_limit_bytes:
+            for _, directory, size in kept:
+                if (
+                    retained_bytes <= self.storage_limit_bytes
+                    or directory in protected_directories
+                ):
+                    continue
+                self._remove_directory(directory)
+                retained_bytes -= size
+                removed += 1
+        return MediaPruneResult(
+            removed_directories=removed,
+            retained_bytes=max(0, retained_bytes),
+        )
+
+    def _validated_source(self, source_path: str | Path, directory: Path) -> Path:
+        source = Path(source_path)
+        try:
+            resolved = source.resolve(strict=True)
+            resolved.relative_to(directory.resolve(strict=True))
+            status = resolved.stat()
+        except (FileNotFoundError, OSError, RuntimeError, ValueError):
+            raise MediaProcessingError("invalid_media") from None
+        if (
+            source.is_symlink()
+            or not stat.S_ISREG(status.st_mode)
+            or status.st_uid != os.getuid()
+            or status.st_size <= 0
+        ):
+            raise MediaProcessingError("invalid_media")
+        os.chmod(resolved, 0o600)
+        return resolved
+
+    def _try_video_audio(self, source: Path, destination: Path) -> bool:
+        try:
+            self._run_ffmpeg(
+                [
+                    "-i",
+                    str(source),
+                    "-map",
+                    "0:a:0",
+                    "-vn",
+                    "-ac",
+                    "1",
+                    "-ar",
+                    "16000",
+                    "-c:a",
+                    "libmp3lame",
+                    "-b:a",
+                    "64k",
+                ],
+                destination,
+                error_kind="audio_unavailable",
+            )
+        except MediaProcessingError as error:
+            if error.kind == "audio_unavailable":
+                return False
+            raise
+        return True
+
+    def _run_ffmpeg(
+        self,
+        arguments: list[str],
+        destination: Path,
+        *,
+        error_kind: str,
+    ) -> None:
+        if not self.dependency_ready():
+            raise MediaProcessingError("ffmpeg_unavailable")
+        temporary = destination.with_name(
+            f".{destination.stem}.part-{os.getpid()}{destination.suffix}"
+        )
+        with contextlib.suppress(FileNotFoundError):
+            temporary.unlink()
+        try:
+            result = subprocess.run(
+                [
+                    str(self.ffmpeg_binary),
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-nostdin",
+                    "-y",
+                    *arguments,
+                    str(temporary),
+                ],
+                check=False,
+                capture_output=True,
+                timeout=self.timeout_seconds,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            raise MediaProcessingError("ffmpeg_unavailable") from None
+        try:
+            if result.returncode != 0 or not self._usable_file(temporary):
+                raise MediaProcessingError(error_kind)
+            os.chmod(temporary, 0o600)
+            os.replace(temporary, destination)
+            os.chmod(destination, 0o600)
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                temporary.unlink()
+
+    @staticmethod
+    def _frame_positions(duration_seconds: int) -> tuple[float, ...]:
+        duration = max(0.1, float(duration_seconds))
+        ratios = (
+            (0.5,)
+            if duration_seconds < 3
+            else (0.25, 0.75)
+            if duration_seconds < 10
+            else (0.15, 0.5, 0.85)
+        )
+        upper = max(0.0, duration - 0.05)
+        return tuple(min(max(0.0, duration * ratio), upper) for ratio in ratios)
+
+    @staticmethod
+    def _usable_file(path: Path) -> bool:
+        try:
+            status = path.stat()
+        except OSError:
+            return False
+        return bool(
+            not path.is_symlink()
+            and stat.S_ISREG(status.st_mode)
+            and status.st_size > 0
+        )
+
+    @staticmethod
+    def _touch_directory(directory: Path) -> None:
+        with contextlib.suppress(OSError):
+            os.utime(directory, None)
+
+    def _protected_directories(
+        self,
+        protected_paths: Iterable[str | Path],
+    ) -> set[Path]:
+        directories: set[Path] = set()
+        for value in protected_paths:
+            try:
+                resolved = Path(value).resolve(strict=False)
+                relative = resolved.relative_to(self.root)
+            except (OSError, RuntimeError, ValueError):
+                continue
+            if relative.parts and MEDIA_KEY_PATTERN.fullmatch(relative.parts[0]):
+                directories.add(self.root / relative.parts[0])
+        return directories
+
+    @staticmethod
+    def _directory_size(directory: Path) -> int:
+        total = 0
+        for path in directory.rglob("*"):
+            try:
+                status = path.lstat()
+            except OSError:
+                continue
+            if stat.S_ISREG(status.st_mode):
+                total += int(status.st_size)
+        return total
+
+    def _remove_directory(self, directory: Path) -> None:
+        try:
+            directory.relative_to(self.root)
+        except ValueError:
+            raise MediaProcessingError("unsafe_storage") from None
+        if (
+            directory.parent != self.root
+            or directory.is_symlink()
+            or MEDIA_KEY_PATTERN.fullmatch(directory.name) is None
+        ):
+            raise MediaProcessingError("unsafe_storage")
+        shutil.rmtree(directory)

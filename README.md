@@ -12,8 +12,20 @@ The bridge supports:
 - text, voice, video context, files, visible progress, final answers,
   approvals, queueing, steer, archive/restore, mode controls, and health checks.
 
+When a final Codex answer explicitly links a safe local file inside the target
+workspace, the Bridge sends that file to the same Topic as a native Telegram
+attachment. It does not require the file to live in a special output
+directory. Files outside the workspace and secret-shaped, blocked, or oversized
+paths remain ineligible.
+
 The Telegram bot token and all private mappings remain outside the project and
 outside this repository.
+
+An ordinary Telegram document is downloaded into the owner-only media cache
+under the existing 20 MB Bot API limit and reaches Codex as a native mentioned
+file. Its sanitized filename is preserved, its caption remains the user's
+instruction, and a queued document stays protected across bridge restarts.
+The bridge never executes an inbound file.
 
 > Status: alpha. Codex App Server is experimental. Unknown protocol versions
 > fail closed instead of dispatching queued work.

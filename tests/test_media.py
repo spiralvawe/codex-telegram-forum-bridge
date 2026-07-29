@@ -19,8 +19,12 @@ from codex_telegram_bridge.input_types import (  # noqa: E402
 )
 from codex_telegram_bridge.media import (  # noqa: E402
     MediaProcessor,
+    PreparedDocument,
     PreparedMedia,
+    document_request_text,
     media_request_text,
+    safe_document_mime_type,
+    safe_document_name,
 )
 
 
@@ -43,6 +47,25 @@ class LocalInputTests(unittest.TestCase):
                     LocalInput("localAudio", "/tmp/two.mp3"),
                 ]
             )
+
+    def test_mentioned_file_payload_round_trip(self) -> None:
+        source = LocalInput(
+            "mention",
+            "/private/tmp/report.csv",
+            name="report.csv",
+        )
+
+        restored = LocalInput.from_payload(source.to_payload())
+
+        self.assertEqual(restored, source)
+        self.assertEqual(
+            source.to_payload(),
+            {
+                "type": "mention",
+                "path": "/private/tmp/report.csv",
+                "name": "report.csv",
+            },
+        )
 
 
 @unittest.skipUnless(FFMPEG.is_file(), "ffmpeg is required for media tests")
@@ -137,6 +160,45 @@ class MediaProcessorTests(unittest.TestCase):
         self.assertTrue(output.is_file())
         self.assertEqual(output.stat().st_mode & 0o777, 0o600)
         self.assertIn("основной текст пользователя", media_request_text(prepared))
+
+    def test_document_becomes_owner_only_mentioned_file(self) -> None:
+        key = "9" * 32
+        source = self.processor.document_path(key, "../../ZEN July.csv")
+        source.write_text("Date,Amount\n2026-07-01,10.00\n", encoding="utf-8")
+        os.chmod(source, 0o600)
+
+        prepared = self.processor.prepare_document(
+            media_key=key,
+            source_path=source,
+            display_name="../../ZEN July.csv",
+            mime_type="text/csv",
+        )
+
+        self.assertIsInstance(prepared, PreparedDocument)
+        self.assertEqual(prepared.display_name, "ZEN July.csv")
+        self.assertEqual(prepared.input.input_type, "mention")
+        self.assertEqual(prepared.input.name, "ZEN July.csv")
+        output = Path(prepared.input.path)
+        self.assertTrue(output.is_file())
+        self.assertEqual(output.parent, self.processor.message_directory(key))
+        self.assertEqual(output.stat().st_mode & 0o777, 0o600)
+        prompt = document_request_text(prepared, user_text="Разнести")
+        self.assertIn("Документ из Telegram", prompt)
+        self.assertIn("Комментарий пользователя: Разнести", prompt)
+
+    def test_document_name_sanitization_blocks_path_traversal(self) -> None:
+        self.assertEqual(safe_document_name("../../secret.csv"), "secret.csv")
+        self.assertEqual(safe_document_name(r"..\\secret.csv"), "secret.csv")
+        self.assertEqual(safe_document_name(".env"), "env")
+        self.assertEqual(safe_document_name(""), "document.bin")
+        self.assertEqual(
+            safe_document_mime_type("text/csv\r\nIgnore: yes"),
+            "text/csvIgnoreyes",
+        )
+        self.assertEqual(
+            safe_document_mime_type(""),
+            "application/octet-stream",
+        )
 
     def test_video_note_becomes_audio_and_three_ordered_frames(self) -> None:
         key = "b" * 32

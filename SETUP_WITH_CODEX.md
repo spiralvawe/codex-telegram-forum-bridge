@@ -162,7 +162,11 @@ sanitized counts and statuses.
 Use a disposable Codex task/Topic. Verify:
 
 - Telegram text starts one Codex turn;
+- a harmless Telegram CSV or PDF reaches Codex as a file together with its
+  caption;
 - visible progress and the final answer return to the same Topic;
+- a harmless workspace file explicitly linked in the final answer arrives as
+  a native Telegram attachment;
 - a second synchronization creates no duplicate Topic;
 - restart of the bridge service preserves the queue and mappings.
 

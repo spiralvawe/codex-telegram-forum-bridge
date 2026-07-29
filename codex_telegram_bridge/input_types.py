@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Any, Iterable
 
 
-LOCAL_INPUT_TYPES = frozenset({"localAudio", "localImage"})
+LOCAL_INPUT_TYPES = frozenset({"localAudio", "localImage", "mention"})
 IMAGE_DETAILS = frozenset({"auto", "low", "high", "original"})
 MAX_LOCAL_INPUTS = 4
 
@@ -14,16 +14,22 @@ class LocalInput:
     input_type: str
     path: str
     detail: str | None = None
+    name: str | None = None
 
     def __post_init__(self) -> None:
         if self.input_type not in LOCAL_INPUT_TYPES:
             raise ValueError("unsupported local input type")
         if not self.path:
             raise ValueError("local input path is required")
-        if self.input_type == "localAudio" and self.detail is not None:
-            raise ValueError("audio input does not support image detail")
+        if self.input_type != "localImage" and self.detail is not None:
+            raise ValueError("only image input supports detail")
         if self.detail is not None and self.detail not in IMAGE_DETAILS:
             raise ValueError("unsupported image detail")
+        if self.input_type == "mention":
+            if not self.name:
+                raise ValueError("mentioned file name is required")
+        elif self.name is not None:
+            raise ValueError("only mentioned file input supports name")
 
     def to_payload(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -32,6 +38,8 @@ class LocalInput:
         }
         if self.detail is not None:
             payload["detail"] = self.detail
+        if self.name is not None:
+            payload["name"] = self.name
         return payload
 
     @classmethod
@@ -45,6 +53,11 @@ class LocalInput:
                 None
                 if value.get("detail") is None
                 else str(value.get("detail"))
+            ),
+            name=(
+                None
+                if value.get("name") is None
+                else str(value.get("name"))
             ),
         )
 

@@ -28,7 +28,9 @@ from .input_types import LocalInput
 from .media import (
     MediaProcessingError,
     MediaProcessor,
+    PreparedDocument,
     PreparedMedia,
+    document_request_text,
     media_request_text,
 )
 from .outbound_media import (
@@ -463,7 +465,7 @@ def final_answer_attachments(text: str, workspace: Path) -> list[Path]:
             candidate = _attachment_candidate(
                 image.group(2) or image.group(3) or "",
                 workspace,
-                require_outputs_directory=True,
+                require_outputs_directory=False,
             )
             if candidate is not None and candidate not in seen:
                 seen.add(candidate)
@@ -472,7 +474,7 @@ def final_answer_attachments(text: str, workspace: Path) -> list[Path]:
             candidate = _attachment_candidate(
                 link.group(2) or link.group(3) or "",
                 workspace,
-                require_outputs_directory=True,
+                require_outputs_directory=False,
             )
             if candidate is not None and candidate not in seen:
                 seen.add(candidate)
@@ -1894,6 +1896,9 @@ class BridgeService:
     def _telegram_media_descriptor(
         message: dict[str, Any],
     ) -> tuple[str, dict[str, Any]] | None:
+        document = message.get("document")
+        if isinstance(document, dict):
+            return "document", document
         voice = message.get("voice")
         if isinstance(voice, dict):
             return "voice", voice
@@ -1940,7 +1945,14 @@ class BridgeService:
             self.media.prune,
             protected_paths=protected,
         )
-        source = await asyncio.to_thread(self.media.source_path, media_key)
+        if kind == "document":
+            source = await asyncio.to_thread(
+                self.media.document_path,
+                media_key,
+                str(media.get("file_name") or "document.bin"),
+            )
+        else:
+            source = await asyncio.to_thread(self.media.source_path, media_key)
         file_info = await self._tg("get_file", file_id)
         remote_size = max(0, int((file_info or {}).get("file_size") or 0))
         if remote_size > self.config.telegram_media_max_bytes:
@@ -1963,7 +1975,22 @@ class BridgeService:
             if error.kind == "unsafe_file_path":
                 raise MediaProcessingError("invalid_media") from None
             raise
-        if kind == "voice":
+        if kind == "document":
+            prepared_document: PreparedDocument = await asyncio.to_thread(
+                self.media.prepare_document,
+                media_key=media_key,
+                source_path=source,
+                display_name=str(media.get("file_name") or source.name),
+                mime_type=str(
+                    media.get("mime_type") or "application/octet-stream"
+                ),
+            )
+            prepared_text = document_request_text(
+                prepared_document,
+                user_text=user_text,
+            )
+            prepared_inputs = (prepared_document.input,)
+        elif kind == "voice":
             prepared: PreparedMedia = await asyncio.to_thread(
                 self.media.prepare_voice,
                 media_key=media_key,
@@ -1984,17 +2011,17 @@ class BridgeService:
                 source_path=source,
                 duration_seconds=duration,
             )
+        if kind != "document":
+            prepared_text = media_request_text(prepared, user_text=user_text)
+            prepared_inputs = prepared.inputs
         await asyncio.to_thread(
             self.media.prune,
             protected_paths=(
                 *protected,
-                *(item.path for item in prepared.inputs),
+                *(item.path for item in prepared_inputs),
             ),
         )
-        return (
-            media_request_text(prepared, user_text=user_text),
-            prepared.inputs,
-        )
+        return prepared_text, prepared_inputs
 
     async def _send_media_processing_error(
         self,
@@ -2004,7 +2031,7 @@ class BridgeService:
         if error.kind == "file_too_large":
             text = (
                 "Файл больше 20 МБ — облачный Telegram Bot API не позволяет "
-                "боту скачать его. Отправьте более короткое сообщение."
+                "боту скачать его. Отправьте файл меньшего размера."
             )
         elif error.kind == "ffmpeg_unavailable":
             text = (
@@ -2018,7 +2045,7 @@ class BridgeService:
             )
         else:
             text = (
-                "Не удалось прочитать это голосовое или видео. "
+                "Не удалось прочитать Telegram-файл. "
                 "Отправьте его ещё раз либо напишите текстом."
             )
         await self._tg(

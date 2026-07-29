@@ -465,7 +465,7 @@ def final_answer_attachments(text: str, workspace: Path) -> list[Path]:
             candidate = _attachment_candidate(
                 image.group(2) or image.group(3) or "",
                 workspace,
-                require_outputs_directory=True,
+                require_outputs_directory=False,
             )
             if candidate is not None and candidate not in seen:
                 seen.add(candidate)
@@ -474,7 +474,7 @@ def final_answer_attachments(text: str, workspace: Path) -> list[Path]:
             candidate = _attachment_candidate(
                 link.group(2) or link.group(3) or "",
                 workspace,
-                require_outputs_directory=True,
+                require_outputs_directory=False,
             )
             if candidate is not None and candidate not in seen:
                 seen.add(candidate)

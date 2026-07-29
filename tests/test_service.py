@@ -3165,6 +3165,8 @@ class ServiceRoutingTests(unittest.IsolatedAsyncioTestCase):
         docs_directory.mkdir()
         reference = docs_directory / "reference.pdf"
         reference.write_bytes(b"reference")
+        handoff = docs_directory / "handoff.md"
+        handoff.write_text("# Handoff\n", encoding="utf-8")
         secret = workspace / ".env"
         secret.write_text("TOKEN=do-not-send", encoding="utf-8")
         outside = workspace.parent / "outside.pdf"
@@ -3173,6 +3175,7 @@ class ServiceRoutingTests(unittest.IsolatedAsyncioTestCase):
             f":codex-file-citation{{path=\"{reference}\" purpose=\"output\"}}\n"
             f"[отчёт](<{report}>)\n"
             f"[справка](<{reference}>)\n"
+            f"[инструкция](<{handoff}>)\n"
             f":codex-file-citation{{path=\"{secret}\" purpose=\"output\"}}\n"
             f":codex-file-citation{{path=\"{outside}\" purpose=\"output\"}}\n"
             f"`[код](<{report}>)`\n"
@@ -3182,7 +3185,48 @@ class ServiceRoutingTests(unittest.IsolatedAsyncioTestCase):
 
         attachments = final_answer_attachments(source, workspace)
 
-        self.assertEqual(attachments, [reference.resolve(), report.resolve()])
+        self.assertEqual(
+            attachments,
+            [reference.resolve(), report.resolve(), handoff.resolve()],
+        )
+
+    async def test_final_answer_uploads_explicit_workspace_file_link(
+        self,
+    ) -> None:
+        topic = self.store.topic_for_thread("thread-1")
+        self.assertIsNotNone(topic)
+        docs_directory = self.service.config.workspace / "docs"
+        docs_directory.mkdir()
+        handoff = docs_directory / "handoff.md"
+        handoff.write_text("# Handoff\n", encoding="utf-8")
+        self.store.upsert_turn_context(
+            thread_id="thread-1",
+            turn_id="turn-workspace-file",
+            source_message_id=91,
+        )
+
+        await self.service.mirror_item(
+            topic,
+            {
+                "id": "workspace-file-final",
+                "type": "agentMessage",
+                "phase": "final_answer",
+                "text": f"Готово. [Инструкция](<{handoff}>)",
+            },
+            turn_id="turn-workspace-file",
+            item_origin="notification",
+        )
+
+        self.assertEqual(len(self.telegram.sent_messages), 1)
+        self.assertEqual(len(self.telegram.sent_documents), 1)
+        document = self.telegram.sent_documents[0]
+        self.assertEqual(document["file_path"], handoff.resolve())
+        self.assertEqual(document["reply_to_message_id"], 801)
+        self.assertEqual(document["caption"], "📎 handoff.md")
+        self.assertIn(
+            "Инструкция — docs/handoff.md",
+            self.telegram.sent_messages[0]["text"],
+        )
 
     async def test_final_answer_uploads_explicit_output_file(self) -> None:
         topic = self.store.topic_for_thread("thread-1")

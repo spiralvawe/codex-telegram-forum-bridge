@@ -14,6 +14,13 @@ answers, and explicitly mirrored files from the linked workspace.
   database outside the repository.
 - Protect the Telegram account with strong authentication.
 
+Inbound Telegram documents are untrusted input. They are filename- and
+MIME-sanitized, bounded by the Bot API download limit, stored owner-only, and
+passed to Codex as mentioned files; the bridge does not execute them.
+Conversely, a safe local file is uploaded only when the final Codex answer
+explicitly links it. Workspace containment, symlink, sensitive-path,
+blocked-file-type, and size checks still apply.
+
 ## Bot token
 
 Never put the bot token in:

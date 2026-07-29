@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.0 — 2026-07-29
 
 - Accept Telegram document messages as private, durable Codex mentioned-file
   inputs instead of silently forwarding only their captions.

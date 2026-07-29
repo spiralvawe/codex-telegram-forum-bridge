@@ -22,7 +22,7 @@ SQLite records:
 
 - Telegram group/user binding;
 - Codex task ↔ Telegram Topic mappings;
-- queued Telegram input and local media references;
+- queued Telegram input and local voice/video/document references;
 - inbound update completion;
 - outbound message/media delivery reservations;
 - Topic-creation intents;
@@ -33,6 +33,12 @@ Telegram does not provide idempotency keys for Topic creation, messages, or
 media uploads. The bridge therefore reserves side effects before network calls.
 Ambiguous outcomes are surfaced for reconciliation and are not blindly
 replayed.
+
+Telegram documents use the same durable media lifecycle as voice and video:
+the downloaded owner-only file remains referenced by a queued input and is
+therefore protected from cache pruning until dispatch is resolved. Final-answer
+attachments travel in the opposite direction only when Codex explicitly links
+a safe file inside the configured workspace.
 
 ## Codex connection
 

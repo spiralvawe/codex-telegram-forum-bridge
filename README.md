@@ -21,6 +21,12 @@ paths remain ineligible.
 The Telegram bot token and all private mappings remain outside the project and
 outside this repository.
 
+An ordinary Telegram document is downloaded into the owner-only media cache
+under the existing 20 MB Bot API limit and reaches Codex as a native mentioned
+file. Its sanitized filename is preserved, its caption remains the user's
+instruction, and a queued document stays protected across bridge restarts.
+The bridge never executes an inbound file.
+
 > Status: alpha. Codex App Server is experimental. Unknown protocol versions
 > fail closed instead of dispatching queued work.
 

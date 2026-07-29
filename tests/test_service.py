@@ -458,6 +458,13 @@ class ServiceRoutingTests(unittest.IsolatedAsyncioTestCase):
             "from": {"id": 100, "is_bot": False},
             "chat": {"id": -100500, "type": "supergroup"},
         }
+        if kind == "document":
+            message[kind].update(
+                {
+                    "file_name": "ZEN statement July.csv",
+                    "mime_type": "text/csv",
+                }
+            )
         if reply_to_message is not None:
             message["reply_to_message"] = reply_to_message
         return {"update_id": 1, "message": message}
@@ -721,6 +728,56 @@ class ServiceRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("-100500", observed_keys[0])
         self.assertEqual(inputs, (audio,))
         self.assertIn("Комментарий пользователя: проверь", text)
+
+    async def test_document_starts_with_native_mentioned_file_input(
+        self,
+    ) -> None:
+        update = self.topic_media_message("document")
+        update["message"]["caption"] = "Разнести эту выписку"
+
+        await self.service.handle_telegram_update(update)
+
+        self.codex.start_turn.assert_awaited_once()
+        kwargs = self.codex.start_turn.await_args.kwargs
+        self.assertIn("Документ из Telegram", kwargs["text"])
+        self.assertIn(
+            "Комментарий пользователя: Разнести эту выписку",
+            kwargs["text"],
+        )
+        self.assertEqual(len(kwargs["local_inputs"]), 1)
+        document = kwargs["local_inputs"][0]
+        self.assertEqual(document.input_type, "mention")
+        self.assertEqual(document.name, "ZEN statement July.csv")
+        path = Path(document.path)
+        self.assertTrue(path.is_file())
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        queued = self.store.queued_message_for_client_id("tg:-100500:90")
+        self.assertIsNotNone(queued)
+        self.assertEqual(queued.local_inputs, (document,))
+
+    async def test_document_without_caption_still_starts_a_turn(self) -> None:
+        await self.service.handle_telegram_update(
+            self.topic_media_message("document")
+        )
+
+        self.codex.start_turn.assert_awaited_once()
+        kwargs = self.codex.start_turn.await_args.kwargs
+        self.assertIn("Документ из Telegram", kwargs["text"])
+        self.assertEqual(kwargs["local_inputs"][0].input_type, "mention")
+
+    async def test_busy_document_queue_protects_downloaded_file(self) -> None:
+        self.service.busy_threads.add("thread-1")
+
+        await self.service.handle_telegram_update(
+            self.topic_media_message("document")
+        )
+
+        queued = self.store.next_queued("thread-1")
+        self.assertIsNotNone(queued)
+        self.assertEqual(queued.local_inputs[0].input_type, "mention")
+        document_path = Path(queued.local_inputs[0].path)
+        self.assertIn(document_path, self.store.active_local_input_paths())
+        self.codex.start_turn.assert_not_awaited()
 
     async def test_video_note_queue_keeps_audio_and_frames_for_steer(
         self,

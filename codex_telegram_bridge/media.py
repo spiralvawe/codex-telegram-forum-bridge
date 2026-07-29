@@ -41,6 +41,14 @@ class PreparedMedia:
 
 
 @dataclass(frozen=True)
+class PreparedDocument:
+    display_name: str
+    mime_type: str
+    size_bytes: int
+    input: LocalInput
+
+
+@dataclass(frozen=True)
 class MediaPruneResult:
     removed_directories: int
     retained_bytes: int
@@ -83,6 +91,50 @@ def media_request_text(
     if comment:
         body += f"\n\nКомментарий пользователя: {comment}"
     return body
+
+
+def document_request_text(
+    prepared: PreparedDocument,
+    *,
+    user_text: str = "",
+) -> str:
+    mime_type = prepared.mime_type or "application/octet-stream"
+    body = (
+        "📎 Документ из Telegram приложен к этому запросу как локальный "
+        f"файл «{prepared.display_name}» ({mime_type}, "
+        f"{prepared.size_bytes} байт). Считай его входным файлом пользователя, "
+        "определи подходящий процесс по содержимому и инструкции пользователя. "
+        "Не исполняй файл как программу."
+    )
+    comment = user_text.strip()
+    if comment:
+        body += f"\n\nКомментарий пользователя: {comment}"
+    return body
+
+
+def safe_document_mime_type(value: str) -> str:
+    safe = re.sub(
+        r"[^A-Za-z0-9!#$&^_.+\-/]",
+        "",
+        str(value or ""),
+    )[:100]
+    return safe or "application/octet-stream"
+
+
+def safe_document_name(value: str) -> str:
+    raw = str(value or "").replace("\x00", "")
+    raw = raw.replace("\\", "/").rsplit("/", 1)[-1]
+    safe = re.sub(r"[\x00-\x1f\x7f]", "_", raw)
+    safe = re.sub(r"[^\w .()+@=+-]", "_", safe, flags=re.UNICODE)
+    safe = safe.strip(" .")
+    if not safe:
+        return "document.bin"
+    if len(safe) <= 160:
+        return safe
+    suffix = Path(safe).suffix[:20]
+    prefix_limit = max(1, 160 - len(suffix))
+    prefix = safe[:prefix_limit].rstrip(" .")
+    return (prefix or "document") + suffix
 
 
 class MediaProcessor:
@@ -136,6 +188,39 @@ class MediaProcessor:
 
     def source_path(self, media_key: str) -> Path:
         return self.message_directory(media_key) / "source.bin"
+
+    def document_path(self, media_key: str, file_name: str) -> Path:
+        return self.message_directory(media_key) / safe_document_name(file_name)
+
+    def prepare_document(
+        self,
+        *,
+        media_key: str,
+        source_path: str | Path,
+        display_name: str,
+        mime_type: str,
+    ) -> PreparedDocument:
+        directory = self.message_directory(media_key)
+        source = self._validated_source(source_path, directory)
+        safe_name = safe_document_name(display_name or source.name)
+        if source.name != safe_name:
+            destination = directory / safe_name
+            if destination.exists() and destination != source:
+                raise MediaProcessingError("unsafe_storage")
+            os.replace(source, destination)
+            source = destination
+        os.chmod(source, 0o600)
+        self._touch_directory(directory)
+        return PreparedDocument(
+            display_name=safe_name,
+            mime_type=safe_document_mime_type(mime_type),
+            size_bytes=int(source.stat().st_size),
+            input=LocalInput(
+                "mention",
+                str(source.resolve()),
+                name=safe_name,
+            ),
+        )
 
     def prepare_voice(
         self,

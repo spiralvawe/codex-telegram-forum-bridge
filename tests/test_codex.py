@@ -368,6 +368,46 @@ class CodexUnixWebSocketTests(unittest.IsolatedAsyncioTestCase):
             },
         )
 
+    async def test_turn_start_preserves_mentioned_file_input(self) -> None:
+        server = self.make_server()
+        server.resume_thread = AsyncMock()
+        server.request = AsyncMock(
+            return_value={"turn": {"id": "turn-document"}}
+        )
+        document = LocalInput(
+            "mention",
+            "/private/tmp/statement.csv",
+            name="statement.csv",
+        )
+
+        turn = await server.start_turn(
+            thread_id="thread-document",
+            text="Telegram document",
+            client_id="tg:-100:92",
+            local_inputs=(document,),
+        )
+
+        self.assertEqual(turn["id"], "turn-document")
+        server.request.assert_awaited_once_with(
+            "turn/start",
+            {
+                "threadId": "thread-document",
+                "input": [
+                    {
+                        "type": "text",
+                        "text": "Telegram document",
+                        "text_elements": [],
+                    },
+                    {
+                        "type": "mention",
+                        "path": "/private/tmp/statement.csv",
+                        "name": "statement.csv",
+                    },
+                ],
+                "clientUserMessageId": "tg:-100:92",
+            },
+        )
+
     async def test_turn_steer_preserves_native_audio_input(self) -> None:
         server = self.make_server()
         server.request = AsyncMock(return_value={"turnId": "turn-active"})

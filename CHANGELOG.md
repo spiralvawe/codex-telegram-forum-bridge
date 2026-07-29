@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Accept Telegram document messages as private, durable Codex mentioned-file
+  inputs instead of silently forwarding only their captions.
+- Sanitize inbound document names, preserve the 20 MB Telegram download limit,
+  and keep queued files protected from media-cache pruning.
+
 ## 0.1.1 — 2026-07-28
 
 - Normalize integer weekly-limit values before decimal formatting so the

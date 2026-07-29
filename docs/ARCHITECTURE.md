@@ -40,6 +40,28 @@ therefore protected from cache pruning until dispatch is resolved. Final-answer
 attachments travel in the opposite direction only when Codex explicitly links
 a safe file inside the configured workspace.
 
+## Global turn capacity
+
+`max_active_turns` optionally bounds simultaneous Codex turns for the whole
+bridge instance. Zero preserves the original unlimited behavior. A positive
+limit counts the union of turns started by the bridge and active turns observed
+from another App Server client.
+
+The start RPC is serialized, but its lock is not the capacity boundary. A slot
+stays occupied until an authoritative terminal notification or a full thread
+history read reports `completed`, `failed`, or `interrupted`. An interrupt
+request alone does not release it. Pending inputs remain durable in SQLite,
+and a global FIFO dispatcher starts work from any eligible Topic when a slot
+opens. On restart, the bridge first reconstructs active-turn state from Codex,
+then resumes queued dispatch, so startup order cannot temporarily exceed the
+configured limit.
+
+A `dispatching` queue reservation also occupies one slot per Topic. That state
+means a start or steer RPC may have reached Codex even though its response was
+lost. The reservation keeps blocking new cross-Topic starts across reconnects
+until authoritative history either finds its client ID or satisfies the
+guarded multi-read miss reconciliation and returns it to `pending`.
+
 ## Codex connection
 
 Both macOS and Linux use the Codex CLI-managed local App Server daemon and its

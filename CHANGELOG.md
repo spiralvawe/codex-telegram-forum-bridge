@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Add an optional global `max_active_turns` guard for low-memory hosts.
+  Cross-Topic work remains in the durable FIFO queue until an actual terminal
+  Codex state frees capacity, including after bridge restart. Outcome-unknown
+  dispatch reservations keep occupying capacity until history reconciliation.
+
 ## 0.2.0 — 2026-07-29
 
 - Accept Telegram document messages as private, durable Codex mentioned-file

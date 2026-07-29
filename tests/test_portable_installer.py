@@ -41,6 +41,19 @@ class PortableInstallerTests(unittest.TestCase):
         with self.assertRaises(Exception):
             installer.validate_instance("---")
 
+    def test_prepare_parser_accepts_pi_safe_turn_limit(self) -> None:
+        args = installer.build_parser().parse_args(
+            [
+                "prepare",
+                "--workspace",
+                "/srv/project",
+                "--max-active-turns",
+                "1",
+            ]
+        )
+
+        self.assertEqual(args.max_active_turns, 1)
+
     def test_systemd_units_contain_no_bot_token(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

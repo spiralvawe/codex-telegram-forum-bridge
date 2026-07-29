@@ -189,6 +189,7 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
         secret_backend=args.secret_backend,
         secret_reference=args.secret_reference,
         secret_vault=args.secret_vault,
+        max_active_turns=args.max_active_turns,
     )
     if args.codex_binary:
         payload = config.as_file_payload()
@@ -629,6 +630,15 @@ def build_parser() -> argparse.ArgumentParser:
     prepare_parser.add_argument("--secret-reference")
     prepare_parser.add_argument("--secret-vault")
     prepare_parser.add_argument("--codex-binary")
+    prepare_parser.add_argument(
+        "--max-active-turns",
+        type=int,
+        default=None,
+        help=(
+            "Maximum simultaneous Codex turns; 0 keeps the default "
+            "unlimited behavior."
+        ),
+    )
     prepare_parser.add_argument(
         "--skip-app-server-bootstrap",
         action="store_true",

@@ -1065,6 +1065,50 @@ class StoreTests(unittest.TestCase):
         self.store.mark_queue(queued.queue_id, "sent")
         self.assertIsNone(self.store.next_queued("thread-1"))
 
+    def test_pending_queue_threads_are_global_fifo_and_block_uncertain_thread(
+        self,
+    ) -> None:
+        first = self.store.enqueue(
+            thread_id="thread-first",
+            chat_id=-1001,
+            topic_id=10,
+            telegram_message_id=99,
+            text="first",
+            client_id="tg:-1001:99",
+        )
+        self.store.enqueue(
+            thread_id="thread-second",
+            chat_id=-1001,
+            topic_id=11,
+            telegram_message_id=100,
+            text="second",
+            client_id="tg:-1001:100",
+        )
+        self.store.enqueue(
+            thread_id="thread-first",
+            chat_id=-1001,
+            topic_id=10,
+            telegram_message_id=101,
+            text="third",
+            client_id="tg:-1001:101",
+        )
+
+        self.assertEqual(
+            self.store.pending_queue_thread_ids(),
+            ["thread-first", "thread-second"],
+        )
+        self.assertTrue(self.store.claim_queue(first.queue_id))
+        self.assertEqual(
+            self.store.pending_queue_thread_ids(),
+            ["thread-second"],
+        )
+        self.assertEqual(
+            self.store.dispatching_queue_thread_ids(),
+            {"thread-first"},
+        )
+        self.store.mark_queue(first.queue_id, "sent")
+        self.assertEqual(self.store.dispatching_queue_thread_ids(), set())
+
     def test_queue_preserves_native_local_inputs(self) -> None:
         media_directory = Path(self.temp_dir.name) / "media" / ("a" * 32)
         media_directory.mkdir(parents=True, mode=0o700)

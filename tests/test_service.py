@@ -668,6 +668,386 @@ class ServiceRoutingTests(unittest.IsolatedAsyncioTestCase):
         ][0][0]["callback_data"]
         self.assertEqual(callback_data, f"stq:{queued.queue_id}")
 
+    async def test_global_turn_limit_serializes_topics_until_terminal_event(
+        self,
+    ) -> None:
+        self.service.config = replace(
+            self.service.config,
+            max_active_turns=1,
+        )
+        self.store.upsert_topic(
+            thread_id="thread-2",
+            chat_id=-100500,
+            topic_id=51,
+            title="Second topic",
+        )
+        first = self.store.enqueue(
+            thread_id="thread-1",
+            chat_id=-100500,
+            topic_id=50,
+            telegram_message_id=90,
+            text="first task",
+            client_id="tg:-100500:90",
+        )
+        second = self.store.enqueue(
+            thread_id="thread-2",
+            chat_id=-100500,
+            topic_id=51,
+            telegram_message_id=91,
+            text="second task",
+            client_id="tg:-100500:91",
+        )
+        self.codex.start_turn.side_effect = [
+            {"id": "turn-first"},
+            {"id": "turn-second"},
+        ]
+
+        await asyncio.gather(
+            self.service.dispatch_queued_capacity(),
+            self.service.dispatch_queued_capacity(),
+        )
+
+        self.assertEqual(self.codex.start_turn.await_count, 1)
+        self.assertEqual(
+            self.store.queued_message(first.queue_id).status,
+            "sent",
+        )
+        self.assertEqual(
+            self.store.queued_message(second.queue_id).status,
+            "pending",
+        )
+        self.assertEqual(self.service.active_turn_count(), 1)
+
+        await self.service.on_codex_notification(
+            {
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "turn": {
+                        "id": "turn-first",
+                        "status": "completed",
+                    },
+                },
+            }
+        )
+
+        self.assertEqual(self.codex.start_turn.await_count, 2)
+        self.assertEqual(
+            self.codex.start_turn.await_args.kwargs["thread_id"],
+            "thread-2",
+        )
+        self.assertEqual(
+            self.store.queued_message(second.queue_id).status,
+            "sent",
+        )
+        self.assertEqual(
+            self.service.active_turns,
+            {"thread-2": "turn-second"},
+        )
+
+    async def test_default_global_turn_limit_preserves_parallel_topics(
+        self,
+    ) -> None:
+        self.assertEqual(self.service.config.max_active_turns, 0)
+        self.store.upsert_topic(
+            thread_id="thread-2",
+            chat_id=-100500,
+            topic_id=51,
+            title="Second topic",
+        )
+        for thread_id, topic_id, message_id in (
+            ("thread-1", 50, 90),
+            ("thread-2", 51, 91),
+        ):
+            self.store.enqueue(
+                thread_id=thread_id,
+                chat_id=-100500,
+                topic_id=topic_id,
+                telegram_message_id=message_id,
+                text=f"task for {thread_id}",
+                client_id=f"tg:-100500:{message_id}",
+            )
+        self.codex.start_turn.side_effect = [
+            {"id": "turn-first"},
+            {"id": "turn-second"},
+        ]
+
+        await self.service.dispatch_queued_capacity()
+
+        self.assertEqual(self.codex.start_turn.await_count, 2)
+        self.assertEqual(self.service.active_turn_count(), 2)
+
+    async def test_outcome_unknown_start_blocks_other_topic_capacity(
+        self,
+    ) -> None:
+        self.service.config = replace(
+            self.service.config,
+            max_active_turns=1,
+        )
+        self.store.upsert_topic(
+            thread_id="thread-2",
+            chat_id=-100500,
+            topic_id=51,
+            title="Second topic",
+        )
+        uncertain = self.store.enqueue(
+            thread_id="thread-1",
+            chat_id=-100500,
+            topic_id=50,
+            telegram_message_id=90,
+            text="possibly accepted",
+            client_id="tg:-100500:90",
+        )
+        self.codex.start_turn.side_effect = RuntimeError(
+            "response lost after request"
+        )
+
+        await self.service.dispatch_queued_capacity()
+
+        self.assertTrue(self.service.codex_available)
+        self.assertEqual(
+            self.store.queued_message(uncertain.queue_id).status,
+            "dispatching",
+        )
+        self.assertIn("thread-1", self.service.busy_threads)
+        self.assertEqual(self.service.active_turn_count(), 1)
+
+        restarted_telegram = FakeTelegram()
+        restarted = BridgeService(
+            config=self.service.config,
+            store=self.store,
+            telegram=restarted_telegram,
+        )
+        restarted.codex = SimpleNamespace(
+            start_turn=AsyncMock(return_value={"id": "must-not-start"}),
+        )
+        self.assertEqual(restarted.active_turn_count(), 1)
+        second_update = self.topic_message(
+            "must wait for reconciliation",
+            message_id=91,
+        )
+        second_update["message"]["message_thread_id"] = 51
+        await restarted.handle_telegram_update(second_update)
+
+        self.assertEqual(self.codex.start_turn.await_count, 1)
+        restarted.codex.start_turn.assert_not_awaited()
+        second = self.store.queued_message_for_client_id("tg:-100500:91")
+        self.assertIsNotNone(second)
+        self.assertEqual(second.status, "pending")
+        self.assertEqual(
+            self.store.dispatching_queue_thread_ids(),
+            {"thread-1"},
+        )
+
+    async def test_interrupt_request_does_not_release_global_capacity(
+        self,
+    ) -> None:
+        self.service.config = replace(
+            self.service.config,
+            max_active_turns=1,
+        )
+        self.store.upsert_topic(
+            thread_id="thread-2",
+            chat_id=-100500,
+            topic_id=51,
+            title="Second topic",
+        )
+        queued = self.store.enqueue(
+            thread_id="thread-2",
+            chat_id=-100500,
+            topic_id=51,
+            telegram_message_id=91,
+            text="wait for interruption",
+            client_id="tg:-100500:91",
+        )
+        self.service.active_turns["thread-1"] = "turn-running"
+        self.service.busy_threads.add("thread-1")
+        topic = self.store.topic_for_thread("thread-1")
+        self.assertIsNotNone(topic)
+
+        await self.service.cancel_turn(topic, reply_to=90)
+        await self.service.dispatch_queued_capacity()
+
+        self.codex.interrupt_turn.assert_awaited_once()
+        self.codex.start_turn.assert_not_awaited()
+        self.assertEqual(
+            self.store.queued_message(queued.queue_id).status,
+            "pending",
+        )
+
+        await self.service.on_codex_notification(
+            {
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "turn": {
+                        "id": "turn-running",
+                        "status": "interrupted",
+                    },
+                },
+            }
+        )
+
+        self.codex.start_turn.assert_awaited_once_with(
+            thread_id="thread-2",
+            text="wait for interruption",
+            client_id="tg:-100500:91",
+        )
+        self.assertEqual(
+            self.store.queued_message(queued.queue_id).status,
+            "sent",
+        )
+
+    async def test_stale_terminal_event_cannot_release_newer_observed_turn(
+        self,
+    ) -> None:
+        self.service.config = replace(
+            self.service.config,
+            max_active_turns=1,
+        )
+        self.store.upsert_topic(
+            thread_id="thread-2",
+            chat_id=-100500,
+            topic_id=51,
+            title="Second topic",
+        )
+        self.store.enqueue(
+            thread_id="thread-2",
+            chat_id=-100500,
+            topic_id=51,
+            telegram_message_id=91,
+            text="must keep waiting",
+            client_id="tg:-100500:91",
+        )
+        self.service.busy_threads.add("thread-1")
+        self.service.observed_turns["thread-1"] = "turn-newer"
+
+        await self.service.on_codex_notification(
+            {
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "turn": {
+                        "id": "turn-older",
+                        "status": "completed",
+                    },
+                },
+            }
+        )
+
+        self.codex.start_turn.assert_not_awaited()
+        self.assertIn("thread-1", self.service.busy_threads)
+
+        await self.service.on_codex_notification(
+            {
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "turn": {
+                        "id": "turn-newer",
+                        "status": "completed",
+                    },
+                },
+            }
+        )
+
+        self.codex.start_turn.assert_awaited_once()
+
+    async def test_sync_reconstructs_global_capacity_before_dispatching_queue(
+        self,
+    ) -> None:
+        self.service.config = replace(
+            self.service.config,
+            max_active_turns=1,
+        )
+        self.store.upsert_topic(
+            thread_id="thread-2",
+            chat_id=-100500,
+            topic_id=51,
+            title="Second topic",
+        )
+        queued = self.store.enqueue(
+            thread_id="thread-2",
+            chat_id=-100500,
+            topic_id=51,
+            telegram_message_id=91,
+            text="durable after restart",
+            client_id="tg:-100500:91",
+        )
+        external_active = True
+        summaries = [
+            {
+                "id": "thread-1",
+                "name": "Test topic",
+                "preview": "",
+                "updatedAt": 101,
+            },
+            {
+                "id": "thread-2",
+                "name": "Second topic",
+                "preview": "",
+                "updatedAt": 102,
+            },
+        ]
+
+        async def list_threads(*, archived: bool) -> list[dict[str, Any]]:
+            return [] if archived else summaries
+
+        async def read_thread(thread_id: str) -> dict[str, Any]:
+            if thread_id == "thread-2":
+                return {
+                    "id": "thread-2",
+                    "status": {"type": "idle"},
+                    "updatedAt": 102,
+                    "turns": [],
+                }
+            return {
+                "id": "thread-1",
+                "status": {
+                    "type": "active" if external_active else "idle"
+                },
+                "updatedAt": 101,
+                "turns": [
+                    {
+                        "id": "turn-external",
+                        "status": (
+                            "inProgress" if external_active else "completed"
+                        ),
+                        "completedAt": None if external_active else 103,
+                        "items": [],
+                    }
+                ],
+            }
+
+        self.service.codex = SimpleNamespace(
+            list_threads=AsyncMock(side_effect=list_threads),
+            read_thread=AsyncMock(side_effect=read_thread),
+            resume_thread=AsyncMock(return_value={}),
+            start_turn=AsyncMock(return_value={"id": "turn-after-restart"}),
+        )
+
+        await self.service.sync_threads()
+
+        self.service.codex.start_turn.assert_not_awaited()
+        self.assertEqual(self.service.active_turn_count(), 1)
+        self.assertEqual(
+            self.store.queued_message(queued.queue_id).status,
+            "pending",
+        )
+
+        external_active = False
+        await self.service.sync_threads()
+
+        self.service.codex.start_turn.assert_awaited_once_with(
+            thread_id="thread-2",
+            text="durable after restart",
+            client_id="tg:-100500:91",
+        )
+        self.assertEqual(
+            self.store.queued_message(queued.queue_id).status,
+            "sent",
+        )
+
     async def test_voice_message_starts_with_native_audio_input(self) -> None:
         audio = self.local_media_input()
         self.service._prepare_telegram_media = AsyncMock(  # type: ignore[method-assign]
@@ -1313,6 +1693,171 @@ class ServiceRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.service._create_topic_for_thread.assert_awaited_once()
         self.service.start_turn.assert_awaited_once()
 
+    async def test_new_thread_waiting_for_global_capacity_replies_to_topic_echo(
+        self,
+    ) -> None:
+        self.service.config = replace(
+            self.service.config,
+            max_active_turns=1,
+        )
+        self.service.busy_threads.add("thread-1")
+        self.service.active_turns["thread-1"] = "turn-running"
+        new_topic = TopicBinding(
+            thread_id="thread-new",
+            chat_id=-100500,
+            topic_id=60,
+            title="Queued new task",
+            archived=False,
+            last_updated_at=0,
+        )
+        self.codex.start_thread = AsyncMock(
+            return_value={"id": "thread-new", "updatedAt": 123}
+        )
+        self.codex.set_thread_name = AsyncMock()
+        self.service._create_topic_for_thread = AsyncMock(
+            return_value=new_topic
+        )
+
+        await self.service.create_thread_from_general(
+            "Queued new task",
+            source_message_id=100,
+        )
+
+        request = self.store.new_thread_request(-100500, 100)
+        self.assertIsNotNone(request)
+        self.assertIsNotNone(request.echo_message_id)
+        queued = self.store.queued_message_for_client_id("tg:-100500:100")
+        self.assertIsNotNone(queued)
+        self.assertEqual(queued.status, "pending")
+        self.assertEqual(
+            queued.telegram_message_id,
+            request.echo_message_id,
+        )
+        queue_card = self.telegram.sent_messages[-1]
+        self.assertEqual(queue_card["message_thread_id"], 60)
+        self.assertEqual(
+            queue_card["reply_to_message_id"],
+            request.echo_message_id,
+        )
+        self.codex.start_turn.assert_not_awaited()
+
+    async def test_new_thread_history_and_notification_keep_topic_echo_reply(
+        self,
+    ) -> None:
+        for index, user_origin in enumerate(("history", "notification")):
+            with self.subTest(user_origin=user_origin):
+                thread_id = f"thread-new-{user_origin}"
+                turn_id = f"turn-new-{user_origin}"
+                topic_id = 60 + index
+                general_message_id = 100 + index
+                echo_message_id = 900 + index
+                client_id = f"tg:-100500:{general_message_id}"
+                self.store.upsert_topic(
+                    thread_id=thread_id,
+                    chat_id=-100500,
+                    topic_id=topic_id,
+                    title=f"New {user_origin}",
+                )
+                self.store.enqueue(
+                    thread_id=thread_id,
+                    chat_id=-100500,
+                    topic_id=topic_id,
+                    telegram_message_id=echo_message_id,
+                    text=f"New task from {user_origin}",
+                    client_id=client_id,
+                )
+                topic = self.store.topic_for_thread(thread_id)
+                self.assertIsNotNone(topic)
+                user_item = {
+                    "id": f"user-{user_origin}",
+                    "type": "userMessage",
+                    "clientId": client_id,
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": f"New task from {user_origin}",
+                        }
+                    ],
+                }
+                if user_origin == "history":
+                    await self.service.sync_thread_history(
+                        {
+                            "id": thread_id,
+                            "turns": [
+                                {
+                                    "id": turn_id,
+                                    "status": "inProgress",
+                                    "items": [user_item],
+                                }
+                            ],
+                        },
+                        topic,
+                        initial=False,
+                    )
+                else:
+                    await self.service.on_codex_notification(
+                        {
+                            "method": "item/completed",
+                            "params": {
+                                "threadId": thread_id,
+                                "turnId": turn_id,
+                                "item": user_item,
+                            },
+                        }
+                    )
+
+                context = self.store.turn_context(thread_id, turn_id)
+                self.assertIsNotNone(context)
+                self.assertEqual(
+                    context.source_message_id,
+                    echo_message_id,
+                )
+                rich_before = len(self.telegram.sent_rich_messages)
+                final_before = len(self.telegram.sent_messages)
+                await self.service.on_codex_notification(
+                    {
+                        "method": "item/completed",
+                        "params": {
+                            "threadId": thread_id,
+                            "turnId": turn_id,
+                            "item": {
+                                "id": f"progress-{user_origin}",
+                                "type": "agentMessage",
+                                "phase": "commentary",
+                                "text": f"Progress from {user_origin}",
+                            },
+                        },
+                    }
+                )
+                await self.service.on_codex_notification(
+                    {
+                        "method": "item/completed",
+                        "params": {
+                            "threadId": thread_id,
+                            "turnId": turn_id,
+                            "item": {
+                                "id": f"final-{user_origin}",
+                                "type": "agentMessage",
+                                "phase": "final_answer",
+                                "text": f"Final from {user_origin}",
+                            },
+                        },
+                    }
+                )
+
+                self.assertEqual(
+                    self.telegram.sent_rich_messages[rich_before][
+                        "reply_to_message_id"
+                    ],
+                    echo_message_id,
+                )
+                self.assertEqual(
+                    self.telegram.sent_messages[final_before][
+                        "reply_to_message_id"
+                    ],
+                    echo_message_id,
+                )
+
     async def test_new_thread_ambiguous_start_fails_closed_on_replay(
         self,
     ) -> None:
@@ -1729,6 +2274,32 @@ class ServiceRoutingTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(self.telegram.edited_markups, [])
         self.assertIn("истории Codex", self.telegram.callback_answers[-1][1])
+
+    async def test_new_steer_waits_behind_outcome_unknown_steer(self) -> None:
+        uncertain = self.store.enqueue(
+            thread_id="thread-1",
+            chat_id=-100500,
+            topic_id=50,
+            telegram_message_id=90,
+            text="possibly steered",
+            client_id="tg:-100500:90",
+        )
+        self.assertTrue(self.store.claim_queue(uncertain.queue_id))
+        self.service.busy_threads.add("thread-1")
+        self.service.observed_turns["thread-1"] = "turn-active"
+
+        await self.service.handle_telegram_update(
+            self.topic_message("/steer wait behind it", message_id=91)
+        )
+
+        self.codex.steer_turn.assert_not_awaited()
+        queued = self.store.queued_message_for_client_id("tg:-100500:91")
+        self.assertIsNotNone(queued)
+        self.assertEqual(queued.status, "pending")
+        self.assertIn(
+            "сверяется с историей Codex",
+            self.telegram.sent_messages[-1]["text"],
+        )
 
     async def test_idle_queued_steer_waits_for_history_reconciliation(
         self,

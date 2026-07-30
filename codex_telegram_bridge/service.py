@@ -120,6 +120,7 @@ PROGRESS_KIND_LABELS = {
     "tool_status": "Статус инструмента",
 }
 ARCHIVE_TOPIC_TITLE = "Архивные треды"
+VOICE_THREAD_PENDING_TITLE = "Распознаётся голосовая задача"
 ARCHIVE_PAGE_SIZE = 20
 ARCHIVE_DELETE_CONCURRENCY = 6
 ARCHIVE_DELETE_CONFIRM_ATTEMPTS = 4
@@ -2394,6 +2395,9 @@ class BridgeService:
             }
             if local_inputs:
                 create_arguments["local_inputs"] = local_inputs
+            descriptor = self._telegram_media_descriptor(message)
+            if descriptor is not None and descriptor[0] == "voice":
+                create_arguments["defer_title_to_codex"] = True
             await self.create_thread_from_general(
                 request_text,
                 **create_arguments,
@@ -4822,6 +4826,7 @@ class BridgeService:
         *,
         source_message_id: int,
         local_inputs: tuple[LocalInput, ...] = (),
+        defer_title_to_codex: bool = False,
     ) -> None:
         if not self.codex_available:
             await self._send_degraded_message(
@@ -4847,7 +4852,10 @@ class BridgeService:
         if request.status == "turn_started":
             return
 
-        base_title = clean_topic_title(prompt, "New Codex thread")
+        base_title = clean_topic_title(
+            VOICE_THREAD_PENDING_TITLE if defer_title_to_codex else prompt,
+            "New Codex thread",
+        )
         if request.thread_id is None:
             if request.status == "thread_start_outcome_unknown":
                 await self._tg(
@@ -4881,8 +4889,9 @@ class BridgeService:
                 status="thread_created",
                 thread_id=thread_id,
             )
-            with contextlib.suppress(CodexProtocolError):
-                await self.codex.set_thread_name(thread_id, base_title)
+            if not defer_title_to_codex:
+                with contextlib.suppress(CodexProtocolError):
+                    await self.codex.set_thread_name(thread_id, base_title)
             updated_at = int(thread.get("updatedAt") or 0)
         else:
             thread_id = request.thread_id

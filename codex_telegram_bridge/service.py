@@ -13,6 +13,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
+from enum import Enum
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
@@ -86,6 +87,7 @@ CODEX_RECONNECT_BACKOFF_MAXIMUM_SECONDS = 60.0
 LOOP_BACKOFF_JITTER_RATIO = 0.2
 QUEUE_DISPATCH_RECONCILIATION_REQUIRED_MISSES = 2
 QUEUE_DISPATCH_RECONCILIATION_GRACE_SECONDS = 5
+TERMINAL_TURN_TOMBSTONE_LIMIT = 1_024
 PROGRESS_ENTRY_MAX_BYTES = 4_000
 RICH_PROGRESS_TEXT_LIMIT_BYTES = 30_000
 RICH_PROGRESS_BLOCK_LIMIT = 100
@@ -1036,6 +1038,22 @@ class TopicCreationUnresolvedError(RuntimeError):
     """A remote Topic may exist, so automatic creation must stop."""
 
 
+class TurnStartOutcome(Enum):
+    """Result of one guarded turn-start attempt.
+
+    Only ``STARTED`` is truthy so existing boolean callers keep their
+    behavior while queue dispatch can distinguish capacity blocking from an
+    outcome-unknown Codex RPC.
+    """
+
+    STARTED = "started"
+    BLOCKED = "blocked"
+    OUTCOME_UNKNOWN = "outcome_unknown"
+
+    def __bool__(self) -> bool:
+        return self is TurnStartOutcome.STARTED
+
+
 def loop_error_kind(error: BaseException) -> str:
     if isinstance(error, TelegramError):
         return error.kind
@@ -1357,6 +1375,9 @@ class BridgeService:
         self.pending_requests: dict[str, PendingServerRequest] = {}
         self._pending_locks: dict[str, asyncio.Lock] = {}
         self._dispatch_locks: dict[str, asyncio.Lock] = {}
+        self._turn_start_lock = asyncio.Lock()
+        self._queue_dispatch_lock = asyncio.Lock()
+        self._capacity_reserved_threads: set[str] = set()
         self._mirror_locks: dict[str, asyncio.Lock] = {}
         self._progress_locks: dict[str, asyncio.Lock] = {}
         self._progress_elapsed_minutes_rendered: dict[
@@ -1369,6 +1390,7 @@ class BridgeService:
             tuple[str, str, str],
             dict[str, Any],
         ] = {}
+        self._terminal_turns: dict[tuple[str, str], None] = {}
         self._telegram_slots = asyncio.Semaphore(16)
         self._topic_create_lock = asyncio.Lock()
         self._archive_hub_lock = asyncio.Lock()
@@ -1422,6 +1444,7 @@ class BridgeService:
         self.active_turns.clear()
         self.observed_turns.clear()
         self.busy_threads.clear()
+        self._terminal_turns.clear()
         self._codex_reconnect_requested.set()
 
     def set_codex_guard(self, reason: str | None) -> None:
@@ -1459,6 +1482,7 @@ class BridgeService:
         self.active_turns.clear()
         self.observed_turns.clear()
         self.busy_threads.clear()
+        self._terminal_turns.clear()
         if expire_prompts and not already_degraded:
             self.pending_requests.clear()
             await self.expire_stale_prompt_cards(
@@ -1728,11 +1752,7 @@ class BridgeService:
 
             retry_attempt = 0
             await self._mark_codex_healthy()
-            for topic in self.store.list_topics():
-                if not self.codex_available:
-                    break
-                if not topic.archived:
-                    await self.dispatch_next_queued(topic.thread_id)
+            await self.dispatch_queued_capacity()
 
             monitor_task = asyncio.create_task(
                 self.codex.wait_closed(),
@@ -3673,56 +3693,96 @@ class BridgeService:
                 "Кнопка относится к другой очереди",
             )
             return
-        if not self.store.claim_queue(queue_id):
-            await self._tg(
-                "answer_callback_query",
-                str(callback["id"]),
-                "Сообщение уже обрабатывается",
-            )
-            return
         topic = self.store.topic_for_thread(queued.thread_id)
         if topic is None or topic.archived:
-            self.store.mark_queue(queue_id, "pending")
             await self._tg(
                 "answer_callback_query",
                 str(callback["id"]),
                 "Тред сейчас в архиве",
             )
             return
-        if self.is_thread_busy(queued.thread_id):
-            success = await self._steer(
-                topic=topic,
-                text=queued.text,
-                client_id=queued.client_id,
-                reply_to=queued.telegram_message_id,
-                quiet=True,
-                local_inputs=queued.local_inputs,
-            )
-            if not success:
-                self._sync_requested.set()
+        async with self._queue_dispatch_lock:
+            if (
+                not self.is_thread_busy(queued.thread_id)
+                and not self.has_global_turn_capacity()
+            ):
                 await self._tg(
                     "answer_callback_query",
                     str(callback["id"]),
-                    "Проверяю доставку по истории Codex",
+                    "Достигнут лимит активных ходов; сообщение осталось в очереди",
                 )
                 return
-        else:
-            success = await self.start_turn(
-                topic=topic,
-                text=queued.text,
-                client_id=queued.client_id,
-                reply_to=queued.telegram_message_id,
-                local_inputs=queued.local_inputs,
-            )
-            if not success:
-                self._sync_requested.set()
+            if (
+                queued.thread_id
+                in self.store.dispatching_queue_thread_ids()
+            ):
                 await self._tg(
                     "answer_callback_query",
                     str(callback["id"]),
-                    "Проверяю, был ли ход принят Codex",
+                    (
+                        "Предыдущее сообщение ещё сверяется с историей Codex; "
+                        "это осталось в очереди"
+                    ),
                 )
                 return
-        self.store.mark_queue(queue_id, "sent")
+            if not self.store.claim_queue(queue_id):
+                await self._tg(
+                    "answer_callback_query",
+                    str(callback["id"]),
+                    "Сообщение уже обрабатывается",
+                )
+                return
+            if self.is_thread_busy(queued.thread_id):
+                success = await self._steer(
+                    topic=topic,
+                    text=queued.text,
+                    client_id=queued.client_id,
+                    reply_to=queued.telegram_message_id,
+                    quiet=True,
+                    local_inputs=queued.local_inputs,
+                )
+                if not success:
+                    self._sync_requested.set()
+                    await self._tg(
+                        "answer_callback_query",
+                        str(callback["id"]),
+                        "Проверяю доставку по истории Codex",
+                    )
+                    return
+            else:
+                self._capacity_reserved_threads.add(queued.thread_id)
+                try:
+                    outcome = await self.start_turn(
+                        topic=topic,
+                        text=queued.text,
+                        client_id=queued.client_id,
+                        reply_to=queued.telegram_message_id,
+                        local_inputs=queued.local_inputs,
+                    )
+                finally:
+                    self._capacity_reserved_threads.discard(
+                        queued.thread_id
+                    )
+                if outcome is TurnStartOutcome.BLOCKED:
+                    self.store.mark_queue(queue_id, "pending")
+                    await self._tg(
+                        "answer_callback_query",
+                        str(callback["id"]),
+                        (
+                            "Лимит активных ходов занят; "
+                            "сообщение осталось в очереди"
+                        ),
+                    )
+                    return
+                if not outcome:
+                    self._sync_requested.set()
+                    await self._tg(
+                        "answer_callback_query",
+                        str(callback["id"]),
+                        "Проверяю, был ли ход принят Codex",
+                    )
+                    return
+            self.store.mark_queue(queue_id, "sent")
         await self._tg(
             "answer_callback_query",
             str(callback["id"]),
@@ -3736,6 +3796,57 @@ class BridgeService:
 
     def is_thread_busy(self, thread_id: str) -> bool:
         return thread_id in self.busy_threads or thread_id in self.active_turns
+
+    def active_turn_count(self) -> int:
+        # A durable ``dispatching`` row means turn/start or turn/steer may
+        # already have reached Codex. It must occupy capacity until history
+        # authoritatively resolves that ambiguity, including after restart.
+        return len(
+            self.busy_threads
+            | set(self.active_turns)
+            | self.store.dispatching_queue_thread_ids()
+        )
+
+    def has_global_turn_capacity(self) -> bool:
+        limit = self.config.max_active_turns
+        return limit == 0 or self.active_turn_count() < limit
+
+    def _has_capacity_for_reserved_start(self, thread_id: str) -> bool:
+        limit = self.config.max_active_turns
+        if limit == 0:
+            return True
+        if thread_id in self._capacity_reserved_threads:
+            # The just-claimed durable dispatch reservation already occupies
+            # this thread's slot, so starting that exact mutation may consume
+            # the reservation but must not require a second slot.
+            return self.active_turn_count() <= limit
+        return self.active_turn_count() < limit
+
+    def _remember_terminal_turn(self, thread_id: str, turn_id: str) -> None:
+        if not thread_id or not turn_id:
+            return
+        key = (thread_id, turn_id)
+        self._terminal_turns.pop(key, None)
+        self._terminal_turns[key] = None
+        while len(self._terminal_turns) > TERMINAL_TURN_TOMBSTONE_LIMIT:
+            self._terminal_turns.pop(next(iter(self._terminal_turns)))
+
+    def _clear_terminal_turn_tracking(
+        self,
+        thread_id: str,
+        turn_id: str,
+    ) -> bool:
+        """Release capacity only for the matching authoritative terminal turn."""
+
+        self._remember_terminal_turn(thread_id, turn_id)
+        active_turn_id = self.active_turns.get(thread_id)
+        if active_turn_id is None and thread_id in self.busy_threads:
+            active_turn_id = self.observed_turns.get(thread_id)
+        if active_turn_id is not None and active_turn_id != turn_id:
+            return False
+        self.active_turns.pop(thread_id, None)
+        self.busy_threads.discard(thread_id)
+        return True
 
     async def archive_thread_from_telegram(
         self,
@@ -3795,13 +3906,23 @@ class BridgeService:
         client_id: str,
         reply_to: int | None,
         local_inputs: tuple[LocalInput, ...] = (),
-    ) -> bool:
+    ) -> TurnStartOutcome:
         if not self.codex_available:
-            return False
-        lock = self._dispatch_locks.setdefault(topic.thread_id, asyncio.Lock())
-        async with lock:
-            if self.is_thread_busy(topic.thread_id):
-                return False
+            return TurnStartOutcome.BLOCKED
+        thread_lock = self._dispatch_locks.setdefault(
+            topic.thread_id,
+            asyncio.Lock(),
+        )
+        async with self._turn_start_lock, thread_lock:
+            if (
+                not self.codex_available
+                or self.is_thread_busy(topic.thread_id)
+                or not self._has_capacity_for_reserved_start(topic.thread_id)
+            ):
+                return TurnStartOutcome.BLOCKED
+            # This reservation remains counted after the RPC returns. It is
+            # released only by a terminal notification or authoritative
+            # history reconciliation, not by leaving this lock scope.
             self.busy_threads.add(topic.thread_id)
             try:
                 start_arguments: dict[str, Any] = {
@@ -3813,13 +3934,24 @@ class BridgeService:
                     start_arguments["local_inputs"] = local_inputs
                 turn = await self.codex.start_turn(**start_arguments)
             except Exception as error:
-                self.busy_threads.discard(topic.thread_id)
                 if isinstance(error, CodexProtocolError):
+                    # Reconnect clears volatile turn state; the durable
+                    # dispatching row continues to occupy capacity.
                     self.request_codex_reconnect("connection_lost")
-                return False
+                # For a non-connection exception keep the in-memory busy
+                # reservation too. A full history read, not the exception,
+                # decides whether Codex accepted the mutation.
+                return TurnStartOutcome.OUTCOME_UNKNOWN
 
             turn_id = str(turn["id"])
-            self.active_turns[topic.thread_id] = turn_id
+            terminal_key = (topic.thread_id, turn_id)
+            terminal_raced = terminal_key in self._terminal_turns
+            self._terminal_turns.pop(terminal_key, None)
+            if not terminal_raced:
+                self.active_turns[topic.thread_id] = turn_id
+                self.busy_threads.add(topic.thread_id)
+            else:
+                self.busy_threads.discard(topic.thread_id)
             self.observed_turns[topic.thread_id] = turn_id
             with contextlib.suppress(Exception):
                 self.store.upsert_turn_context(
@@ -3834,7 +3966,7 @@ class BridgeService:
                     message_thread_id=topic.topic_id,
                     action="typing",
                 )
-            return True
+            return TurnStartOutcome.STARTED
 
     async def send_steer_or_start(
         self,
@@ -3865,6 +3997,18 @@ class BridgeService:
             return
         if self.is_thread_busy(topic.thread_id):
             if queued.status == "dispatching":
+                return
+            if (
+                topic.thread_id
+                in self.store.dispatching_queue_thread_ids()
+            ):
+                await self._announce_queued(
+                    queued,
+                    text=(
+                        "↪️ Предыдущее сообщение ещё сверяется с историей "
+                        "Codex; это осталось в очереди."
+                    ),
+                )
                 return
             if not self.store.claim_queue(queued.queue_id):
                 return
@@ -4004,32 +4148,60 @@ class BridgeService:
             )
 
     async def dispatch_next_queued(self, thread_id: str) -> None:
-        if not self.codex_available or self.is_thread_busy(thread_id):
+        # Keep the historical method name for callers, but capacity is global:
+        # when one slot opens the oldest durable message from any Topic wins.
+        await self.dispatch_queued_capacity()
+
+    async def dispatch_queued_capacity(self) -> None:
+        if not self.codex_available:
             return
-        queued = self.store.claim_next_queued(thread_id)
-        topic = self.store.topic_for_thread(thread_id)
-        if queued is None or topic is None or topic.archived:
-            if queued is not None:
-                self.store.mark_queue(queued.queue_id, "pending")
-            return
-        success = await self.start_turn(
-            topic=topic,
-            text=queued.text,
-            client_id=queued.client_id,
-            reply_to=queued.telegram_message_id,
-            local_inputs=queued.local_inputs,
-        )
-        if success:
-            self.store.mark_queue(queued.queue_id, "sent")
-            await self._finalize_queue_card(
-                queued,
-                text="✅ Отправлено в Codex следующим ходом.",
-            )
-        else:
-            # Keep the reservation in ``dispatching`` until an authoritative
-            # history read proves whether Codex accepted the client id. This
-            # avoids a duplicate turn across an ambiguous disconnect.
-            self._sync_requested.set()
+        async with self._queue_dispatch_lock:
+            while self.codex_available and self.has_global_turn_capacity():
+                candidate_thread_ids = self.store.pending_queue_thread_ids()
+                if not candidate_thread_ids:
+                    return
+                dispatched = False
+                for thread_id in candidate_thread_ids:
+                    if self.is_thread_busy(thread_id):
+                        continue
+                    topic = self.store.topic_for_thread(thread_id)
+                    if topic is None or topic.archived:
+                        continue
+                    queued = self.store.claim_next_queued(thread_id)
+                    if queued is None:
+                        continue
+                    self._capacity_reserved_threads.add(thread_id)
+                    try:
+                        outcome = await self.start_turn(
+                            topic=topic,
+                            text=queued.text,
+                            client_id=queued.client_id,
+                            reply_to=queued.telegram_message_id,
+                            local_inputs=queued.local_inputs,
+                        )
+                    finally:
+                        self._capacity_reserved_threads.discard(thread_id)
+                    if outcome is TurnStartOutcome.BLOCKED:
+                        # No Codex mutation was attempted, so this reservation
+                        # is safe to return to the durable pending queue.
+                        self.store.mark_queue(queued.queue_id, "pending")
+                        return
+                    if not outcome:
+                        # Keep the reservation in ``dispatching`` until
+                        # authoritative history proves whether Codex accepted
+                        # the client id. This avoids a duplicate turn after an
+                        # ambiguous disconnect.
+                        self._sync_requested.set()
+                        return
+                    self.store.mark_queue(queued.queue_id, "sent")
+                    await self._finalize_queue_card(
+                        queued,
+                        text="✅ Отправлено в Codex следующим ходом.",
+                    )
+                    dispatched = True
+                    break
+                if not dispatched:
+                    return
 
     def _remember_thread_mode(
         self,
@@ -4205,6 +4377,11 @@ class BridgeService:
                 f"{self.degraded_reason_label()}; последний успешный контакт="
                 f"{format_health_age(self.codex_last_healthy_at)}; "
                 f"последняя рабочая версия={last_version}."
+            )
+        if self.config.max_active_turns:
+            lines.append(
+                "Активные ходы Codex: "
+                f"{self.active_turn_count()}/{self.config.max_active_turns}."
             )
         uncertainty_line = self._delivery_uncertainty_line()
         if uncertainty_line is not None:
@@ -4676,6 +4853,18 @@ class BridgeService:
                 title=topic_title,
                 updated_at=updated_at,
             )
+        if self.store.topic_for_thread(thread_id) is None:
+            # ``_create_topic_for_thread`` normally records this itself. Keep
+            # the confirmed binding explicit here as well so the durable
+            # cross-topic dispatcher never depends on an in-memory Topic.
+            self.store.upsert_topic(
+                thread_id=topic.thread_id,
+                chat_id=topic.chat_id,
+                topic_id=topic.topic_id,
+                title=topic.title,
+                archived=topic.archived,
+                last_updated_at=topic.last_updated_at,
+            )
         request = self.store.update_new_thread_request(
             chat_id=self.binding.chat_id,
             message_id=source_message_id,
@@ -4701,27 +4890,32 @@ class BridgeService:
                 echo_message_id=echo_message_id,
             )
 
-        if self.is_thread_busy(thread_id):
-            self.store.update_new_thread_request(
-                chat_id=self.binding.chat_id,
-                message_id=source_message_id,
-                status="turn_started",
-                thread_id=thread_id,
-            )
-            return
-        started = await self.start_turn(
-            topic=topic,
+        queued = self.store.enqueue(
+            thread_id=thread_id,
+            chat_id=topic.chat_id,
+            topic_id=topic.topic_id,
+            telegram_message_id=(
+                request.echo_message_id or source_message_id
+            ),
             text=prompt,
             client_id=f"tg:{self.binding.chat_id}:{source_message_id}",
-            reply_to=request.echo_message_id,
             local_inputs=local_inputs,
         )
-        if started:
-            self.store.update_new_thread_request(
-                chat_id=self.binding.chat_id,
-                message_id=source_message_id,
-                status="turn_started",
-                thread_id=thread_id,
+        # The durable queue now owns retry/reconciliation, so replay of the
+        # original /new update must stop even when global capacity is occupied.
+        self.store.update_new_thread_request(
+            chat_id=self.binding.chat_id,
+            message_id=source_message_id,
+            status="turn_started",
+            thread_id=thread_id,
+        )
+        await self.dispatch_queued_capacity()
+        current = self.store.queued_message(queued.queue_id) or queued
+        if current.status != "sent":
+            await self._announce_queued(
+                current,
+                text="↪️ Первый ход нового треда сохранён в очереди.",
+                allow_steer=self.codex_available,
             )
 
     async def bind_manual_topic(
@@ -5717,11 +5911,11 @@ class BridgeService:
                     thread_id,
                     last_updated_at=updated_at,
                 )
-                if dispatch_queue and not self.is_thread_busy(thread_id):
-                    await self.dispatch_next_queued(thread_id)
 
         await self._archive_threads(archived_threads)
         self._initial_sync = False
+        if dispatch_queue:
+            await self.dispatch_queued_capacity()
 
     def _observe_thread_busy(self, thread: dict[str, Any]) -> None:
         thread_id = str(thread["id"])
@@ -5769,6 +5963,8 @@ class BridgeService:
             or has_unfinished_shape
         ):
             self.busy_threads.add(thread_id)
+        elif status in {"completed", "failed", "interrupted"} and turn_id:
+            self._clear_terminal_turn_tracking(thread_id, turn_id)
         elif thread_id not in self.active_turns:
             self.busy_threads.discard(thread_id)
 
@@ -6328,9 +6524,9 @@ class BridgeService:
             for item in turn.get("items") or []:
                 if item.get("type") == "userMessage" and turn_id:
                     client_id = str(item.get("clientId") or "")
-                    source_message_id = telegram_source_message_id(
+                    source_message_id = self._telegram_turn_source_message_id(
+                        topic,
                         client_id,
-                        expected_chat_id=topic.chat_id,
                     )
                     if source_message_id is not None:
                         telegram_client_ids.add(client_id)
@@ -6496,6 +6692,31 @@ class BridgeService:
                     ),
                 ):
                     self.store.mark_queue(queued.queue_id, "pending")
+
+    def _telegram_turn_source_message_id(
+        self,
+        topic: TopicBinding,
+        client_id: str,
+    ) -> int | None:
+        parsed = telegram_source_message_id(
+            client_id,
+            expected_chat_id=topic.chat_id,
+        )
+        if parsed is None:
+            return None
+        queued = self.store.queued_message_for_client_id(client_id)
+        if (
+            queued is not None
+            and queued.thread_id == topic.thread_id
+            and queued.chat_id == topic.chat_id
+            and queued.topic_id == topic.topic_id
+        ):
+            # /new originates in General but is echoed inside the newly
+            # created Topic. The durable queue stores that Topic-local echo
+            # ID, which must remain the reply anchor for progress and final
+            # output. Parsed client IDs are only a fallback.
+            return queued.telegram_message_id
+        return parsed
 
     async def mirror_item(
         self,
@@ -6843,9 +7064,9 @@ class BridgeService:
 
         if item_type == "userMessage":
             client_id = str(item.get("clientId") or "")
-            source_message_id = telegram_source_message_id(
+            source_message_id = self._telegram_turn_source_message_id(
+                topic,
                 client_id,
-                expected_chat_id=topic.chat_id,
             )
             if source_message_id is not None:
                 if turn_id:
@@ -7199,9 +7420,10 @@ class BridgeService:
             turn = params.get("turn") or {}
             turn_id = str(turn.get("id") or "")
             if thread_id and turn_id:
-                self.active_turns[thread_id] = turn_id
                 self.observed_turns[thread_id] = turn_id
-                self.busy_threads.add(thread_id)
+                if (thread_id, turn_id) not in self._terminal_turns:
+                    self.active_turns[thread_id] = turn_id
+                    self.busy_threads.add(thread_id)
                 self.store.upsert_turn_context(
                     thread_id=thread_id,
                     turn_id=turn_id,
@@ -7267,8 +7489,10 @@ class BridgeService:
                 or self.active_turns.get(thread_id)
                 or self.observed_turns.get(thread_id)
             )
-            self.active_turns.pop(thread_id, None)
-            self.busy_threads.discard(thread_id)
+            capacity_released = self._clear_terminal_turn_tracking(
+                thread_id,
+                turn_id,
+            )
             for key in tuple(self._started_items):
                 if key[0] == thread_id and key[1] == turn_id:
                     self._started_items.pop(key, None)
@@ -7292,7 +7516,8 @@ class BridgeService:
                     message_thread_id=topic.topic_id,
                     text=f"⚠️ Ход Codex: {redact_sensitive(detail)}",
                 )
-            await self.dispatch_next_queued(thread_id)
+            if capacity_released:
+                await self.dispatch_queued_capacity()
             return
         if method == "serverRequest/resolved":
             request_id = str(params.get("requestId") or "")

@@ -61,6 +61,57 @@ class PortableConfigTests(unittest.TestCase):
         self.assertNotIn("bot_token", config.as_file_payload())
         self.assertNotIn("token", config.as_file_payload())
 
+    def test_max_active_turns_defaults_to_unlimited_and_round_trips(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            default = BridgeConfig.from_paths(workspace, root / "default")
+            limited = BridgeConfig.from_paths(
+                workspace,
+                root / "limited",
+                max_active_turns=1,
+            )
+            path = root / "limited.json"
+            path.write_text(
+                json.dumps(limited.as_file_payload()),
+                encoding="utf-8",
+            )
+            path.chmod(0o600)
+            restored = BridgeConfig.from_file(path)
+
+        self.assertEqual(default.max_active_turns, 0)
+        self.assertEqual(limited.max_active_turns, 1)
+        self.assertEqual(restored.max_active_turns, 1)
+
+    def test_max_active_turns_can_come_from_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory) / "workspace"
+            workspace.mkdir()
+            with mock.patch.dict(
+                os.environ,
+                {"CODEX_TELEGRAM_MAX_ACTIVE_TURNS": "2"},
+            ):
+                config = BridgeConfig.from_paths(workspace)
+
+        self.assertEqual(config.max_active_turns, 2)
+
+    def test_negative_max_active_turns_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "non-negative integer"):
+            BridgeConfig(
+                workspace=Path.cwd(),
+                state_dir=Path.cwd(),
+                max_active_turns=-1,
+            )
+        with self.assertRaisesRegex(ValueError, "non-negative integer"):
+            BridgeConfig(
+                workspace=Path.cwd(),
+                state_dir=Path.cwd(),
+                max_active_turns=True,
+            )
+
     def test_json_config_requires_owner_only_permissions(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "config.json"

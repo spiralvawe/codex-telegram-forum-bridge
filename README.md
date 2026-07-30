@@ -6,7 +6,8 @@ private Telegram forum supergroup.
 The bridge supports:
 
 - macOS with Codex Desktop/CLI and launchd;
-- a Linux VPS with Codex CLI and a systemd user service;
+- Linux hosts, including ARM64 Raspberry Pi, with Codex CLI and a systemd
+  user service;
 - macOS Keychain, Proton Pass CLI, or an owner-only secret file;
 - one isolated bot + supergroup + runtime database per project;
 - text, voice, video context, files, visible progress, final answers,
@@ -81,6 +82,25 @@ python3 installer.py prepare \
   --secret-backend proton-pass \
   --secret-reference "Codex Telegram Bot - example"
 ```
+
+On a resource-constrained host such as Raspberry Pi 3B+, serialize Codex work
+across all Telegram Topics:
+
+```sh
+python3 installer.py prepare \
+  --workspace "/srv/projects/example" \
+  --secret-backend file \
+  --max-active-turns 1
+```
+
+`max_active_turns=0` is the default and preserves unlimited cross-Topic
+parallelism. A positive value remains occupied until Codex reports the turn as
+completed, failed, or interrupted. Waiting inputs stay in the SQLite queue and
+resume in global FIFO order after capacity becomes available. The same setting
+can be supplied as `CODEX_TELEGRAM_MAX_ACTIVE_TURNS` before `prepare`, or as
+`max_active_turns` in the owner-only JSON configuration. A start/steer request
+whose result is unknown continues to occupy capacity across reconnects until
+Codex history safely reconciles it.
 
 The command prints the owner-only configuration path and the exact next
 commands. Then:

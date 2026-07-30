@@ -4346,6 +4346,45 @@ class BridgeStore:
         ).fetchone()
         return self._queue_from_row(row)
 
+    def pending_queue_thread_ids(self) -> list[str]:
+        """Return dispatchable threads in durable global FIFO order.
+
+        A thread with an outcome-unknown dispatch reservation is deliberately
+        excluded so a later message cannot overtake a request that may already
+        have reached Codex.
+        """
+
+        rows = self.connection.execute(
+            """
+            SELECT pending.thread_id, MIN(pending.id) AS first_pending_id
+            FROM queued_messages AS pending
+            WHERE
+                pending.status = 'pending'
+                AND NOT EXISTS (
+                    SELECT 1
+                    FROM queued_messages AS uncertain
+                    WHERE
+                        uncertain.thread_id = pending.thread_id
+                        AND uncertain.status = 'dispatching'
+                )
+            GROUP BY pending.thread_id
+            ORDER BY first_pending_id, pending.thread_id
+            """
+        ).fetchall()
+        return [str(row["thread_id"]) for row in rows]
+
+    def dispatching_queue_thread_ids(self) -> set[str]:
+        """Return threads whose Codex mutation outcome is still unknown."""
+
+        rows = self.connection.execute(
+            """
+            SELECT DISTINCT thread_id
+            FROM queued_messages
+            WHERE status = 'dispatching'
+            """
+        ).fetchall()
+        return {str(row["thread_id"]) for row in rows}
+
     def claim_queue(self, queue_id: int) -> bool:
         now = utc_now()
         cursor = self.connection.execute(

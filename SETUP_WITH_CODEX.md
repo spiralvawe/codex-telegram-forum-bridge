@@ -36,7 +36,7 @@ On macOS, the Codex binary may instead be bundled at:
 /Applications/ChatGPT.app/Contents/Resources/codex
 ```
 
-On a Linux VPS, also check:
+On a Linux host, also check:
 
 ```sh
 systemctl --user --version
@@ -73,6 +73,11 @@ python3 installer.py prepare \
   --workspace "/absolute/path/to/target-project" \
   --secret-backend BACKEND
 ```
+
+For a host with limited memory, add `--max-active-turns 1`. This is a global
+limit across every Telegram Topic in the instance, not a per-Topic limit.
+Never substitute a shorter RPC-only semaphore: capacity must remain occupied
+until the actual Codex turn reaches a completed, failed, or interrupted state.
 
 For Proton Pass, add a title or opaque `pass://...` reference and optional
 vault:
@@ -169,6 +174,8 @@ Use a disposable Codex task/Topic. Verify:
   a native Telegram attachment;
 - a second synchronization creates no duplicate Topic;
 - restart of the bridge service preserves the queue and mappings.
+- when `max_active_turns` is positive, a task in another Topic remains queued
+  until the current turn actually terminates.
 
 Do not use a physical actuator, production deployment, payment, credential
 change, or other high-impact action as a smoke test.

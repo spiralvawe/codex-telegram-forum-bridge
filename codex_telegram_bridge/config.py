@@ -96,6 +96,7 @@ class BridgeConfig:
     telegram_long_poll_seconds: int = 25
     initial_history_messages: int = 0
     reasoning_mode: str = "off"
+    max_active_turns: int = 0
     compatible_codex_versions: tuple[str, ...] = DEFAULT_COMPATIBLE_CODEX_VERSIONS
     ffmpeg_binary: str = "ffmpeg"
     media_processing_timeout_seconds: float = 120
@@ -113,6 +114,14 @@ class BridgeConfig:
         object.__setattr__(self, "secret_backend", backend)
         if self.keychain_service and backend == "macos-keychain":
             object.__setattr__(self, "secret_reference", self.keychain_service)
+        if (
+            isinstance(self.max_active_turns, bool)
+            or not isinstance(self.max_active_turns, int)
+            or self.max_active_turns < 0
+        ):
+            raise ValueError(
+                "max_active_turns must be a non-negative integer"
+            )
 
     @property
     def database_path(self) -> Path:
@@ -137,6 +146,7 @@ class BridgeConfig:
         secret_backend: str | None = None,
         secret_reference: str | None = None,
         secret_vault: str | None = None,
+        max_active_turns: int | None = None,
     ) -> "BridgeConfig":
         workspace_path = Path(workspace).expanduser().resolve()
         selected_instance = (
@@ -196,6 +206,16 @@ class BridgeConfig:
             reasoning_mode=os.environ.get(
                 "CODEX_TELEGRAM_REASONING_MODE", "off"
             ).lower(),
+            max_active_turns=(
+                max_active_turns
+                if max_active_turns is not None
+                else int(
+                    os.environ.get(
+                        "CODEX_TELEGRAM_MAX_ACTIVE_TURNS",
+                        "0",
+                    )
+                )
+            ),
             ffmpeg_binary=detect_ffmpeg_binary(),
             media_processing_timeout_seconds=float(
                 os.environ.get(
@@ -303,6 +323,7 @@ class BridgeConfig:
                 payload.get("initial_history_messages", 0)
             ),
             reasoning_mode=str(payload.get("reasoning_mode", "off")).lower(),
+            max_active_turns=payload.get("max_active_turns", 0),
             compatible_codex_versions=(
                 tuple(str(value) for value in versions)
                 if isinstance(versions, list)
@@ -359,6 +380,7 @@ class BridgeConfig:
             "telegram_long_poll_seconds": self.telegram_long_poll_seconds,
             "initial_history_messages": self.initial_history_messages,
             "reasoning_mode": self.reasoning_mode,
+            "max_active_turns": self.max_active_turns,
             "media_processing_timeout_seconds": (
                 self.media_processing_timeout_seconds
             ),

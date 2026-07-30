@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import unquote, urlparse
 from zoneinfo import ZoneInfo
 
@@ -1601,19 +1601,19 @@ class BridgeService:
                     return False
                 raise
 
-    async def serve(self) -> None:
+    async def serve(
+        self,
+        *,
+        on_ready: Callable[[], object] | None = None,
+    ) -> None:
         await self._enter_codex_degraded(
             "connecting",
             expire_prompts=False,
             recovery_expected=False,
         )
         await self.expire_stale_prompt_cards()
-        worker_tasks = [
+        critical_tasks = [
             asyncio.create_task(self.telegram_loop(), name="telegram-loop"),
-            asyncio.create_task(
-                self.telegram_setup_loop(),
-                name="telegram-setup-loop",
-            ),
             asyncio.create_task(
                 self.codex_connection_loop(),
                 name="codex-connection-loop",
@@ -1623,18 +1623,44 @@ class BridgeService:
                 name="progress-heartbeat-loop",
             ),
         ]
-        stop_task = asyncio.create_task(self._stop_event.wait(), name="stop-waiter")
+        setup_task = asyncio.create_task(
+            self.telegram_setup_loop(),
+            name="telegram-setup-loop",
+        )
+        stop_task = asyncio.create_task(
+            self._stop_event.wait(),
+            name="stop-waiter",
+        )
+        all_tasks = (*critical_tasks, setup_task, stop_task)
+        if on_ready is not None:
+            on_ready()
         try:
-            await stop_task
+            completed, _ = await asyncio.wait(
+                (*critical_tasks, stop_task),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if stop_task in completed:
+                return
+            for task in critical_tasks:
+                if task not in completed:
+                    continue
+                if task.cancelled():
+                    raise RuntimeError(
+                        f"Critical bridge worker {task.get_name()} "
+                        "was cancelled unexpectedly"
+                    )
+                error = task.exception()
+                if error is not None:
+                    raise error
+                raise RuntimeError(
+                    f"Critical bridge worker {task.get_name()} "
+                    "exited unexpectedly"
+                )
+            raise RuntimeError("Bridge supervisor lost all critical workers")
         finally:
-            for task in (*worker_tasks, stop_task):
+            for task in all_tasks:
                 task.cancel()
-            for task in (*worker_tasks, stop_task):
-                with contextlib.suppress(
-                    asyncio.CancelledError,
-                    CodexProtocolError,
-                ):
-                    await task
+            await asyncio.gather(*all_tasks, return_exceptions=True)
             await self.codex.stop()
 
     async def expire_stale_prompt_cards(

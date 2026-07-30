@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import io
 import sys
@@ -24,6 +25,7 @@ from codex_telegram_bridge.cli import (  # noqa: E402
     mapping_health,
     queue_health_is_acceptable,
     requirements_allow_full_access,
+    run_local_probe,
     setup_final_icon,
     thread_contract_is_valid,
 )
@@ -267,6 +269,89 @@ class DoctorDesktopDetectionTests(unittest.TestCase):
                 self.assertEqual(before, database.stat().st_mtime_ns)
             finally:
                 read_only.close()
+
+    def test_operational_backup_command_never_reads_telegram_secret(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "workspace"
+            state = root / "state"
+            workspace.mkdir()
+            store = BridgeStore(state / "bridge.sqlite3")
+            store.set_setting("backup-command-marker", "present")
+            store.close()
+            output = io.StringIO()
+
+            with (
+                mock.patch(
+                    "codex_telegram_bridge.cli.read_bot_token",
+                    side_effect=AssertionError("secret must not be read"),
+                ),
+                contextlib.redirect_stdout(output),
+            ):
+                result = main(
+                    [
+                        "--workspace",
+                        str(workspace),
+                        "--state-dir",
+                        str(state),
+                        "backup",
+                        "--retention",
+                        "2",
+                    ]
+                )
+
+            self.assertEqual(result, 0)
+            self.assertIn('"ok": true', output.getvalue())
+            backups = list((state / "backups").glob("*.sqlite3"))
+            self.assertEqual(len(backups), 1)
+
+    def test_local_probe_checks_app_server_without_telegram_secret(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "workspace"
+            state = root / "state"
+            workspace.mkdir()
+            store = BridgeStore(state / "bridge.sqlite3")
+            store.close()
+            config = BridgeConfig(
+                workspace=workspace,
+                state_dir=state,
+                codex_app_server_socket=root / "app-server.sock",
+            )
+            fake_app_server = mock.Mock()
+            fake_app_server.start = mock.AsyncMock()
+            fake_app_server.request = mock.AsyncMock(
+                return_value={"config": {}}
+            )
+            fake_app_server.stop = mock.AsyncMock()
+
+            with (
+                mock.patch(
+                    "codex_telegram_bridge.cli.CodexAppServer",
+                    return_value=fake_app_server,
+                ),
+                mock.patch(
+                    "codex_telegram_bridge.cli.read_bot_token",
+                    side_effect=AssertionError("secret must not be read"),
+                ),
+            ):
+                read_only = BridgeStore(config.database_path, read_only=True)
+                try:
+                    result = asyncio.run(run_local_probe(config, read_only))
+                finally:
+                    read_only.close()
+
+            self.assertTrue(result["ok"])
+            self.assertTrue(result["codexAppServer"])
+            fake_app_server.request.assert_awaited_once_with(
+                "config/read",
+                {},
+                timeout=10,
+            )
 
     def test_runtime_refuses_serve_during_interrupted_install(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

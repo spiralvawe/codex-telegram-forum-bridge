@@ -165,8 +165,10 @@ Activation must:
 1. synchronize the current workspace tasks;
 2. require exact task↔Topic parity;
 3. require a passing `doctor`;
-4. install/start launchd on macOS or a systemd user service on Linux;
-5. install/start a five-minute health check.
+4. create and verify an online database snapshot;
+5. install/start launchd on macOS or a systemd user service on Linux;
+6. install/start a five-minute local-only health check and a thirty-minute
+   backup job.
 
 Then run `doctor` one more time through the installed CLI and report only
 sanitized counts and statuses.
@@ -183,6 +185,8 @@ Use a disposable Codex task/Topic. Verify:
   a native Telegram attachment;
 - a second synchronization creates no duplicate Topic;
 - restart of the bridge service preserves the queue and mappings.
+- one manually requested `backup --retention 96` succeeds and its output file
+  remains owner-only;
 - when `max_active_turns` is positive, a task in another Topic remains queued
   until the current turn actually terminates.
 - when `--codex-full-access` is enabled, harmless workspace, outside-workspace,
@@ -191,3 +195,25 @@ Use a disposable Codex task/Topic. Verify:
 
 Do not use a physical actuator, production deployment, payment, credential
 change, or other high-impact action as a smoke test.
+
+## 9. Unattended Linux host check
+
+For a headless Linux node, verify after activation:
+
+```sh
+loginctl show-user "$USER" -p Linger
+systemctl --user is-active codex-telegram-bridge-INSTANCE.service
+systemctl --user is-active codex-telegram-bridge-INSTANCE-health.timer
+systemctl --user is-active codex-telegram-bridge-INSTANCE-backup.timer
+```
+
+The bridge should run as a dedicated non-root account. If administration is
+needed, use a separate administrator account; do not give the Telegram-facing
+runtime user unrestricted sudo. Reboot the host once and repeat `doctor`
+before declaring an unattended installation complete.
+
+The portable installer supervises the application and produces local verified
+snapshots. UPS power, storage health, host/network watchdogs, Wi-Fi policy,
+thermal management, and encrypted off-host backup are machine-specific and
+must be assessed separately. A same-disk snapshot does not survive loss of the
+host or storage device.

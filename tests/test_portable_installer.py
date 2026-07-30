@@ -147,6 +147,18 @@ class PortableInstallerTests(unittest.TestCase):
                 unit_dir
                 / "codex-telegram-bridge-example-a1b2c3-health.service"
             ).read_text(encoding="utf-8")
+            backup_text = (
+                unit_dir
+                / "codex-telegram-bridge-example-a1b2c3-backup.service"
+            ).read_text(encoding="utf-8")
+            backup_timer_text = (
+                unit_dir
+                / "codex-telegram-bridge-example-a1b2c3-backup.timer"
+            ).read_text(encoding="utf-8")
+            health_timer_text = (
+                unit_dir
+                / "codex-telegram-bridge-example-a1b2c3-health.timer"
+            ).read_text(encoding="utf-8")
 
         expected_working_directory = (
             f"WorkingDirectory={config.workspace}\n"
@@ -160,6 +172,25 @@ class PortableInstallerTests(unittest.TestCase):
         self.assertIn("config.json", service_text)
         self.assertNotIn("bot-token", service_text)
         self.assertNotIn("bot-token", health_text)
+        self.assertNotIn("bot-token", backup_text)
+        self.assertIn("Type=notify", service_text)
+        self.assertIn("Restart=always", service_text)
+        self.assertIn("StartLimitIntervalSec=0", service_text)
+        self.assertIn("WatchdogSec=120", service_text)
+        self.assertIn("WatchdogSignal=SIGKILL", service_text)
+        self.assertNotIn("network-online.target", service_text)
+        self.assertIn(" probe-local", health_text)
+        self.assertNotIn(" doctor", health_text)
+        self.assertIn("TimeoutStartSec=120", health_text)
+        self.assertIn("OnUnitInactiveSec=5min", health_timer_text)
+        self.assertNotIn("Persistent=true", health_timer_text)
+        self.assertIn("backup --retention 96", backup_text)
+        self.assertIn("OnCalendar=*:0/30", backup_timer_text)
+        self.assertIn("Persistent=true", backup_timer_text)
+        self.assertEqual(
+            services[2],
+            "codex-telegram-bridge-example-a1b2c3-backup.timer",
+        )
         self.assertGreaterEqual(invoke.call_count, 3)
 
     @unittest.skipUnless(
@@ -222,10 +253,32 @@ class PortableInstallerTests(unittest.TestCase):
             )
             with plist_path.open("rb") as stream:
                 payload = plistlib.load(stream)
+            backup_path = (
+                home / "Library" / "LaunchAgents" / f"{labels[2]}.plist"
+            )
+            with backup_path.open("rb") as stream:
+                backup_payload = plistlib.load(stream)
+            health_path = (
+                home / "Library" / "LaunchAgents" / f"{labels[1]}.plist"
+            )
+            with health_path.open("rb") as stream:
+                health_payload = plistlib.load(stream)
 
         self.assertEqual(labels[0], payload["Label"])
         self.assertIn("config.json", " ".join(payload["ProgramArguments"]))
         self.assertNotIn("bot-token", repr(payload))
+        self.assertIs(payload["KeepAlive"], True)
+        self.assertEqual(payload["ThrottleInterval"], 10)
+        self.assertEqual(
+            payload["ProgramArguments"][-1],
+            "serve",
+        )
+        self.assertEqual(health_payload["ProgramArguments"][-1], "probe-local")
+        self.assertEqual(
+            backup_payload["ProgramArguments"][-3:],
+            ["backup", "--retention", "96"],
+        )
+        self.assertEqual(backup_payload["StartInterval"], 1800)
 
     def test_linux_deactivate_removes_services_but_retains_state(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -238,6 +291,8 @@ class PortableInstallerTests(unittest.TestCase):
                 "codex-telegram-bridge-example-a1b2c3.service",
                 "codex-telegram-bridge-example-a1b2c3-health.service",
                 "codex-telegram-bridge-example-a1b2c3-health.timer",
+                "codex-telegram-bridge-example-a1b2c3-backup.service",
+                "codex-telegram-bridge-example-a1b2c3-backup.timer",
             )
             for name in names:
                 (unit_dir / name).write_text("test\n", encoding="utf-8")

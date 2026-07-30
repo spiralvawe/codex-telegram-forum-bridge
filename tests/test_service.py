@@ -11,7 +11,7 @@ from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -4766,6 +4766,151 @@ class ServiceRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.service.stop()
         await asyncio.wait_for(serve_task, timeout=1)
         self.service.codex.stop.assert_awaited_once()
+
+    async def test_serve_propagates_every_critical_worker_failure(
+        self,
+    ) -> None:
+        class InjectedWorkerFailure(RuntimeError):
+            pass
+
+        workers = {
+            "telegram_loop": "telegram-loop",
+            "codex_connection_loop": "codex-connection-loop",
+            "progress_heartbeat_loop": "progress-heartbeat-loop",
+        }
+        for attribute, task_name in workers.items():
+            with self.subTest(worker=task_name):
+                service = BridgeService(
+                    config=self.service.config,
+                    store=self.store,
+                    telegram=self.telegram,
+                )
+                service.codex = SimpleNamespace(stop=AsyncMock())
+                never_finishes = asyncio.Event()
+
+                async def block() -> None:
+                    await never_finishes.wait()
+
+                async def fail(
+                    current_name: str = task_name,
+                ) -> None:
+                    raise InjectedWorkerFailure(current_name)
+
+                service.telegram_loop = block
+                service.codex_connection_loop = block
+                service.progress_heartbeat_loop = block
+                service.telegram_setup_loop = block
+                setattr(service, attribute, fail)
+
+                with self.assertRaises(InjectedWorkerFailure) as raised:
+                    await asyncio.wait_for(service.serve(), timeout=1)
+
+                self.assertEqual(str(raised.exception), task_name)
+                service.codex.stop.assert_awaited_once()
+
+    async def test_serve_rejects_every_critical_worker_early_return(
+        self,
+    ) -> None:
+        workers = {
+            "telegram_loop": "telegram-loop",
+            "codex_connection_loop": "codex-connection-loop",
+            "progress_heartbeat_loop": "progress-heartbeat-loop",
+        }
+        for attribute, task_name in workers.items():
+            with self.subTest(worker=task_name):
+                service = BridgeService(
+                    config=self.service.config,
+                    store=self.store,
+                    telegram=self.telegram,
+                )
+                service.codex = SimpleNamespace(stop=AsyncMock())
+                never_finishes = asyncio.Event()
+
+                async def block() -> None:
+                    await never_finishes.wait()
+
+                async def finish() -> None:
+                    return None
+
+                service.telegram_loop = block
+                service.codex_connection_loop = block
+                service.progress_heartbeat_loop = block
+                service.telegram_setup_loop = block
+                setattr(service, attribute, finish)
+
+                with self.assertRaises(RuntimeError) as raised:
+                    await asyncio.wait_for(service.serve(), timeout=1)
+
+                self.assertEqual(
+                    str(raised.exception),
+                    f"Critical bridge worker {task_name} exited unexpectedly",
+                )
+                service.codex.stop.assert_awaited_once()
+
+    async def test_setup_worker_return_does_not_block_clean_stop(
+        self,
+    ) -> None:
+        service = BridgeService(
+            config=self.service.config,
+            store=self.store,
+            telegram=self.telegram,
+        )
+        service.codex = SimpleNamespace(stop=AsyncMock())
+        critical_started = asyncio.Event()
+        never_finishes = asyncio.Event()
+
+        async def block() -> None:
+            critical_started.set()
+            await never_finishes.wait()
+
+        async def setup_finishes() -> None:
+            return None
+
+        service.telegram_loop = block
+        service.codex_connection_loop = block
+        service.progress_heartbeat_loop = block
+        service.telegram_setup_loop = setup_finishes
+
+        serve_task = asyncio.create_task(service.serve())
+        await asyncio.wait_for(critical_started.wait(), timeout=1)
+        await asyncio.sleep(0)
+        self.assertFalse(serve_task.done())
+
+        service.stop()
+        await asyncio.wait_for(serve_task, timeout=1)
+        service.codex.stop.assert_awaited_once()
+
+    async def test_serve_reports_ready_only_after_initialization(
+        self,
+    ) -> None:
+        service = BridgeService(
+            config=self.service.config,
+            store=self.store,
+            telegram=self.telegram,
+        )
+        service.codex = SimpleNamespace(stop=AsyncMock())
+        service.expire_stale_prompt_cards = AsyncMock()
+        ready = Mock()
+        critical_started = asyncio.Event()
+        never_finishes = asyncio.Event()
+
+        async def block() -> None:
+            critical_started.set()
+            await never_finishes.wait()
+
+        service.telegram_loop = block
+        service.codex_connection_loop = block
+        service.progress_heartbeat_loop = block
+        service.telegram_setup_loop = block
+
+        serve_task = asyncio.create_task(service.serve(on_ready=ready))
+        await asyncio.wait_for(critical_started.wait(), timeout=1)
+
+        service.expire_stale_prompt_cards.assert_awaited_once()
+        ready.assert_called_once_with()
+        service.stop()
+        await asyncio.wait_for(serve_task, timeout=1)
+        service.codex.stop.assert_awaited_once()
 
     async def test_default_initial_history_mirrors_every_visible_item(
         self,

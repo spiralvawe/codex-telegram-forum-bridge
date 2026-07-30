@@ -17,6 +17,11 @@ private Telegram forum supergroup.
    explicitly accepted owner-only file backend.
 7. Pause only for BotFather, group setup, secret-manager input, `/connect`, and
    a possible user-approved Codex Desktop restart.
-8. Run bootstrap, activation, final `doctor`, and a disposable smoke test.
+8. Run bootstrap, activation, final `doctor`, a verified online backup, and a
+   disposable smoke test.
 9. Stop on unsupported protocol, ambiguous binding, unsafe permissions, test
    failure, or failed health.
+10. For an unattended Linux node, verify user lingering, all installed
+    service/timer units, the non-root privilege boundary, and one cold reboot.
+    Treat UPS, storage, thermal, Wi-Fi, host watchdog, and encrypted off-host
+    backup as separate machine-specific checks.

@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+## 0.3.0 — 2026-07-30
+
+- Supervise the three critical bridge loops as one failure domain. An
+  unexpected return, cancellation, or exception now terminates the process
+  instead of leaving a partially working service alive.
+- Add native systemd readiness and watchdog notifications, restart the
+  long-lived bridge after any unintended exit on Linux and macOS, remove the
+  ineffective user-level network-online dependency, and bound health checks.
+- Add `probe-local`, which verifies SQLite and the local Codex App Server
+  without loading the Telegram token or depending on Telegram, OpenAI, DNS, or
+  Internet availability.
+- Add verified atomic SQLite online backups and install half-hour systemd or
+  launchd backup jobs retaining 96 snapshots. Backup publication/pruning is
+  serialized across processes, and a later run safely removes stale
+  owner-owned temporary files after an interrupted attempt. Activation
+  requires an initial successful backup.
+- Make the installed five-minute health job use the token-free local probe;
+  retain the full network-aware `doctor` for activation and explicit checks.
 - Add an explicit `--codex-full-access` instance mode. New threads, resumed
   threads, and every Telegram-started turn pin `approval_policy=never` and
   `danger-full-access`, preventing restrictive or incomplete host defaults

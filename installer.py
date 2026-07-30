@@ -297,6 +297,27 @@ def systemd_quote(value: str | Path) -> str:
     return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
+def systemd_working_directory(value: str | Path) -> str:
+    """Render one absolute path for systemd's WorkingDirectory= directive."""
+    text = str(value)
+    if "\n" in text or "\r" in text or "\x00" in text:
+        raise InstallerError("Service path contains unsupported characters")
+    if not os.path.isabs(text):
+        raise InstallerError("Service working directory must be absolute")
+
+    # WorkingDirectory= consumes the complete, unquoted value. Unlike
+    # ExecStart=, surrounding quotes are retained as literal path characters.
+    # A trailing slash keeps otherwise-trimmed whitespace, and prevents a
+    # terminal backslash from continuing the next unit-file line.
+    if text[-1].isspace() or text.endswith("\\"):
+        text += "/"
+
+    # Unit specifiers are expanded in WorkingDirectory=. A doubled percent is
+    # the systemd spelling for one literal percent in the actual filesystem
+    # path.
+    return text.replace("%", "%%")
+
+
 def install_systemd(config: BridgeConfig) -> list[str]:
     if not shutil.which("systemctl"):
         raise InstallerError("systemd user services are unavailable")
@@ -314,6 +335,7 @@ def install_systemd(config: BridgeConfig) -> list[str]:
         "PATH",
         "/usr/local/bin:/usr/bin:/bin",
     )
+    working_directory = systemd_working_directory(config.workspace)
 
     unit_path.write_text(
         "\n".join(
@@ -325,7 +347,7 @@ def install_systemd(config: BridgeConfig) -> list[str]:
                 "",
                 "[Service]",
                 "Type=simple",
-                f"WorkingDirectory={systemd_quote(config.workspace)}",
+                f"WorkingDirectory={working_directory}",
                 (
                     f"ExecStart={systemd_quote(cli)} --config "
                     f"{systemd_quote(configuration)} serve"
@@ -352,7 +374,7 @@ def install_systemd(config: BridgeConfig) -> list[str]:
                 "",
                 "[Service]",
                 "Type=oneshot",
-                f"WorkingDirectory={systemd_quote(config.workspace)}",
+                f"WorkingDirectory={working_directory}",
                 (
                     f"ExecStart={systemd_quote(cli)} --config "
                     f"{systemd_quote(configuration)} doctor"

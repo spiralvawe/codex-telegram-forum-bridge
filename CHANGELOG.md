@@ -6,6 +6,9 @@
   Cross-Topic work remains in the durable FIFO queue until an actual terminal
   Codex state frees capacity, including after bridge restart. Outcome-unknown
   dispatch reservations keep occupying capacity until history reconciliation.
+- Generate Linux `WorkingDirectory=` values with directive-specific systemd
+  syntax, so absolute workspace paths containing spaces or literal percent
+  signs load and run without quoted-path or specifier-expansion failures.
 
 ## 0.2.0 — 2026-07-29
 

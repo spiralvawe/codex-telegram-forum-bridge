@@ -3031,7 +3031,12 @@ class MediaWorkerClient:
                 min(64 * 1024, length - len(payload))
             )
             if not chunk:
-                raise MediaWorkerProtocolError("truncated_response")
+                # A peer that closes after sending a valid Content-Length but
+                # before the full body has produced a transport failure, not
+                # an authenticated protocol conclusion.  Treat it like the
+                # other retry/fallback-eligible connection failures so a
+                # worker shutdown cannot take down the Pi media path.
+                raise MediaWorkerUnavailable("worker_unavailable")
             payload.extend(chunk)
             if self._clock() >= deadline:
                 raise MediaWorkerUnavailable("processing_timeout")

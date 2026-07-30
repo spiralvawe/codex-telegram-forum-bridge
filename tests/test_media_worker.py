@@ -976,6 +976,39 @@ class ClientSafetyAndCircuitTests(unittest.TestCase):
                 deadline=5.0,
             )
 
+    def test_truncated_response_is_transport_failure(self) -> None:
+        class FakeSocket:
+            def settimeout(self, value: float) -> None:
+                del value
+
+        class FakeConnection:
+            sock = FakeSocket()
+
+        class TruncatedResponse:
+            chunks = iter((b"x", b""))
+
+            def getheader(self, name: str) -> str | None:
+                return "2" if name == "Content-Length" else None
+
+            def read1(self, length: int) -> bytes:
+                del length
+                return next(self.chunks)
+
+        client = MediaWorkerClient(
+            base_url="https://127.0.0.1:9",
+            ssl_context=ssl.create_default_context(),
+        )
+        with self.assertRaisesRegex(
+            MediaWorkerUnavailable,
+            "worker_unavailable",
+        ):
+            client._read_response(
+                TruncatedResponse(),  # type: ignore[arg-type]
+                maximum=10,
+                connection=FakeConnection(),  # type: ignore[arg-type]
+                deadline=time.monotonic() + 5,
+            )
+
     def test_worker_capability_limit_is_fallback_eligible(self) -> None:
         with self.assertRaisesRegex(
             MediaWorkerUnavailable,

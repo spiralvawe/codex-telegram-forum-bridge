@@ -11,7 +11,9 @@ The bridge supports:
 - macOS Keychain, Proton Pass CLI, or an owner-only secret file;
 - one isolated bot + supergroup + runtime database per project;
 - text, voice, video context, files, visible progress, final answers,
-  approvals, queueing, steer, archive/restore, mode controls, and health checks.
+  approvals, queueing, steer, archive/restore, mode controls, and health checks;
+- supervised long-lived services and verified online SQLite snapshots on both
+  macOS and Linux.
 
 When a final Codex answer explicitly links a safe local file inside the target
 workspace, the Bridge sends that file to the same Topic as a native Telegram
@@ -120,7 +122,8 @@ commands. Then:
 5. run `python3 installer.py activate --config ...`.
 
 `activate` performs a first synchronization and requires a passing `doctor`
-before registering the long-lived bridge and five-minute health service.
+and a verified database snapshot before registering the long-lived bridge,
+five-minute health service, and thirty-minute backup service.
 
 To stop and unregister an instance without deleting its database or Telegram
 Topics:
@@ -144,8 +147,9 @@ SQLite database, media cache, and bounded logs. It is created with mode `0700`;
 the database and configuration are `0600`.
 
 Moving a live instance to another machine is different from making a new
-installation. Stop the old service before transferring its database. Never
-clone a live database into two active consumers.
+installation. Prefer a verified file produced by the `backup` command. Stop
+the old service before cutover and never clone one state database into two
+active consumers.
 
 ## Supported secret backends
 
@@ -183,6 +187,40 @@ hidden prompt into an owner-only regular file outside the repository.
 
 An unsupported Codex version keeps Telegram input durable but disables unsafe
 dispatch until a tested bridge release is installed.
+
+## Recovery and backups
+
+The Linux service uses systemd readiness notification and a watchdog. An
+unexpected exit of any critical internal loop terminates the process so the
+service manager can restart the whole bridge instead of leaving a
+half-working PID. Both systemd and launchd restart the bridge after any
+unintended exit. Health checks are time-bounded.
+
+Activation also installs a backup job. It takes a consistent snapshot while
+the bridge is running through SQLite's online backup API, checks the schema
+and full database integrity, writes owner-only files atomically, and retains
+96 half-hour snapshots:
+
+```sh
+codex-telegram-bridge --config ".../config.json" backup --retention 96
+```
+
+Backup creation, publication, and pruning are serialized across processes.
+The next successful run removes only strictly named owner-owned temporary
+files left by an interrupted prior backup.
+
+`probe-local` checks only SQLite and the local Codex App Server. It deliberately
+does not read the Telegram token or treat Telegram, OpenAI, DNS, or Internet
+outages as reasons to restart local services. The installed five-minute health
+job uses this local probe; run the full network-aware `doctor` manually after
+installation, updates, or recovery.
+
+These snapshots protect against application and database failures on the same
+host. They are not disaster recovery for a failed disk, stolen computer,
+power event, or destroyed machine. Periodically copy a verified snapshot to a
+second trusted device using authenticated transport and encryption at rest.
+Never expose the live database or its backups publicly: both contain private
+conversation and identifier data.
 
 ## Development
 

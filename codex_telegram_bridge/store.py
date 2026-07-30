@@ -3,9 +3,11 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import re
 import sqlite3
 import stat
 import tempfile
+import threading
 import uuid
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
@@ -18,6 +20,19 @@ from .input_types import LocalInput, normalize_local_inputs
 CURRENT_SCHEMA_VERSION = 5
 MIGRATION_BACKUP_RETENTION = 5
 MIGRATION_BACKUP_PREFIX = "bridge-schema-"
+OPERATIONAL_BACKUP_RETENTION = 7
+OPERATIONAL_BACKUP_MAX_RETENTION = 100
+OPERATIONAL_BACKUP_PREFIX = "bridge-operational-"
+OPERATIONAL_BACKUP_LOCK_NAME = ".bridge-operational-backup.lock"
+OPERATIONAL_BACKUP_NAME = re.compile(
+    rf"^{re.escape(OPERATIONAL_BACKUP_PREFIX)}"
+    r"v[0-9]+-[0-9]{8}T[0-9]{12}Z-[0-9a-f]{8}\.sqlite3$"
+)
+OPERATIONAL_BACKUP_TEMP_NAME = re.compile(
+    rf"^\.{re.escape(OPERATIONAL_BACKUP_PREFIX)}"
+    r"[a-z0-9_]{8}\.tmp(?:-(?:journal|wal|shm))?$"
+)
+_OPERATIONAL_BACKUP_PROCESS_LOCK = threading.Lock()
 
 
 def utc_now() -> str:
@@ -181,6 +196,16 @@ class ControlPrompt:
     telegram_message_id: int
     mode: str
     status: str
+
+
+@dataclass(frozen=True)
+class OperationalBackup:
+    path: Path
+    created_at: str
+    schema_version: int
+    size_bytes: int
+    retained_backups: int
+    pruned_backups: int
 
 
 class BridgeStore:
@@ -1362,6 +1387,214 @@ class BridgeStore:
                 backup_connection.close()
             if temporary_path.exists():
                 temporary_path.unlink()
+
+    def create_operational_backup(
+        self,
+        *,
+        retention: int = OPERATIONAL_BACKUP_RETENTION,
+    ) -> OperationalBackup:
+        """Create and verify one online snapshot of the live SQLite database."""
+
+        if (
+            isinstance(retention, bool)
+            or not isinstance(retention, int)
+            or not 1 <= retention <= OPERATIONAL_BACKUP_MAX_RETENTION
+        ):
+            raise ValueError(
+                "operational backup retention must be an integer between "
+                f"1 and {OPERATIONAL_BACKUP_MAX_RETENTION}"
+            )
+
+        backup_directory = self.path.parent / "backups"
+        self._ensure_private_backup_directory(backup_directory)
+        with _OPERATIONAL_BACKUP_PROCESS_LOCK:
+            lock_descriptor = self._open_operational_backup_lock(
+                backup_directory
+            )
+            try:
+                fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
+                self._cleanup_stale_operational_backup_temps(
+                    backup_directory
+                )
+                return self._create_operational_backup_locked(
+                    backup_directory,
+                    retention=retention,
+                )
+            finally:
+                fcntl.flock(lock_descriptor, fcntl.LOCK_UN)
+                os.close(lock_descriptor)
+
+    def _create_operational_backup_locked(
+        self,
+        backup_directory: Path,
+        *,
+        retention: int,
+    ) -> OperationalBackup:
+        created = datetime.now(timezone.utc)
+        schema_version = self.schema_version()
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{OPERATIONAL_BACKUP_PREFIX}",
+            suffix=".tmp",
+            dir=backup_directory,
+        )
+        os.close(descriptor)
+        temporary_path = Path(temporary_name)
+        final_path = backup_directory / (
+            f"{OPERATIONAL_BACKUP_PREFIX}"
+            f"v{schema_version}-"
+            f"{created.strftime('%Y%m%dT%H%M%S%fZ')}-"
+            f"{uuid.uuid4().hex[:8]}.sqlite3"
+        )
+        backup_connection: sqlite3.Connection | None = None
+        try:
+            os.chmod(temporary_path, 0o600)
+            backup_connection = sqlite3.connect(temporary_path)
+            self.connection.backup(backup_connection)
+            backup_connection.close()
+            backup_connection = None
+            os.chmod(temporary_path, 0o600)
+            self._validate_backup_file(
+                temporary_path,
+                expected_version=schema_version,
+            )
+            with temporary_path.open("rb") as backup_file:
+                os.fsync(backup_file.fileno())
+            os.replace(temporary_path, final_path)
+            os.chmod(final_path, 0o600)
+            with final_path.open("rb") as backup_file:
+                os.fsync(backup_file.fileno())
+            retained_backups, pruned_backups = (
+                self._prune_operational_backups(
+                    backup_directory,
+                    retention=retention,
+                    preserve=final_path,
+                )
+            )
+            directory_descriptor = os.open(backup_directory, os.O_RDONLY)
+            try:
+                os.fsync(directory_descriptor)
+            finally:
+                os.close(directory_descriptor)
+            final_status = final_path.stat()
+            return OperationalBackup(
+                path=final_path,
+                created_at=created.isoformat(),
+                schema_version=schema_version,
+                size_bytes=int(final_status.st_size),
+                retained_backups=retained_backups,
+                pruned_backups=pruned_backups,
+            )
+        finally:
+            if backup_connection is not None:
+                backup_connection.close()
+            for suffix in ("", "-journal", "-wal", "-shm"):
+                Path(f"{temporary_path}{suffix}").unlink(missing_ok=True)
+
+    @staticmethod
+    def _open_operational_backup_lock(backup_directory: Path) -> int:
+        lock_path = backup_directory / OPERATIONAL_BACKUP_LOCK_NAME
+        descriptor = os.open(
+            lock_path,
+            (
+                os.O_CREAT
+                | os.O_RDWR
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+            ),
+            0o600,
+        )
+        try:
+            status = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(status.st_mode)
+                or status.st_uid != os.getuid()
+            ):
+                raise SchemaVersionError(
+                    "operational backup lock has an unexpected owner or type"
+                )
+            os.fchmod(descriptor, 0o600)
+            return descriptor
+        except Exception:
+            os.close(descriptor)
+            raise
+
+    @staticmethod
+    def _cleanup_stale_operational_backup_temps(
+        backup_directory: Path,
+    ) -> int:
+        removed = 0
+        for path in backup_directory.iterdir():
+            if OPERATIONAL_BACKUP_TEMP_NAME.fullmatch(path.name) is None:
+                continue
+            try:
+                status = path.lstat()
+            except FileNotFoundError:
+                continue
+            if (
+                not stat.S_ISREG(status.st_mode)
+                or status.st_uid != os.getuid()
+            ):
+                continue
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                continue
+            removed += 1
+        return removed
+
+    @staticmethod
+    def _ensure_private_backup_directory(backup_directory: Path) -> None:
+        if backup_directory.is_symlink():
+            raise SchemaVersionError("backup directory must not be a symlink")
+        backup_directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        status = backup_directory.lstat()
+        if (
+            not stat.S_ISDIR(status.st_mode)
+            or status.st_uid != os.getuid()
+        ):
+            raise SchemaVersionError(
+                "backup directory has an unexpected owner or type"
+            )
+        os.chmod(backup_directory, 0o700)
+
+    @staticmethod
+    def _prune_operational_backups(
+        backup_directory: Path,
+        *,
+        retention: int,
+        preserve: Path | None = None,
+    ) -> tuple[int, int]:
+        candidates: list[tuple[int, str, Path]] = []
+        for path in backup_directory.iterdir():
+            if OPERATIONAL_BACKUP_NAME.fullmatch(path.name) is None:
+                continue
+            try:
+                status = path.lstat()
+            except FileNotFoundError:
+                continue
+            if (
+                not stat.S_ISREG(status.st_mode)
+                or status.st_uid != os.getuid()
+                or stat.S_IMODE(status.st_mode) & 0o077
+            ):
+                continue
+            candidates.append((status.st_mtime_ns, path.name, path))
+
+        candidates.sort(reverse=True)
+        if preserve is not None:
+            for index, candidate in enumerate(candidates):
+                if candidate[2] == preserve:
+                    candidates.insert(0, candidates.pop(index))
+                    break
+        pruned = 0
+        for _, _, obsolete in candidates[retention:]:
+            try:
+                obsolete.unlink()
+            except FileNotFoundError:
+                continue
+            pruned += 1
+        retained = len(candidates) - pruned
+        return retained, pruned
 
     @staticmethod
     def _validate_backup_file(

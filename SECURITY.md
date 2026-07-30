@@ -50,6 +50,23 @@ administrator may act with all filesystem and network privileges of the
 bridge's OS account. Operating-system permissions still apply; this flag does
 not grant root access.
 
+For an unattended full-access node, run the bridge as a dedicated non-root
+account and keep administration in a separate account. Do not grant the
+Telegram-facing runtime user unrestricted sudo: anyone who can issue accepted
+commands in the bound group can exercise that user's filesystem and network
+authority.
+
+## Backup data
+
+Operational SQLite snapshots contain the same private identifiers, queued
+content, mappings, and message state as the live database. They stay
+owner-only and outside the repository. Encrypt any copy that leaves the host,
+authenticate the receiving device, pin its identity, and test restoration
+without starting a second Telegram poller.
+
+Local snapshots are intentionally not described as off-host disaster
+recovery. They do not protect against total storage or machine loss.
+
 ## Reporting
 
 Do not include tokens, private identifiers, message/database dumps, or user

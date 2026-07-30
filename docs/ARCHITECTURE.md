@@ -75,8 +75,25 @@ No Codex port is exposed on the LAN or public internet.
 
 The Python bridge is shared. Only service registration differs:
 
-- macOS: one long-lived LaunchAgent and one five-minute health LaunchAgent;
-- Linux: one systemd user service plus a health service/timer.
+- macOS: one keep-alive bridge LaunchAgent, one five-minute health
+  LaunchAgent, and one thirty-minute online-backup LaunchAgent;
+- Linux: one `Type=notify` systemd user service with a watchdog, plus bounded
+  health and online-backup services/timers.
 
 Each instance has its own configuration, virtual environment, state directory,
 logs, database, and service names.
+
+The bridge process treats its Telegram, Codex-connection, and progress
+heartbeat loops as critical. If any one returns, is cancelled unexpectedly,
+or raises, the supervisor cancels the remaining loops and exits. This gives
+the external service manager an unambiguous failure signal and prevents a
+process that is alive but no longer performing one of its core jobs.
+
+The local `probe-local` path checks SQLite and the Unix-socket App Server
+without retrieving the Telegram secret or consulting remote services. The
+backup path uses SQLite's online backup API, validates schema and integrity,
+fsyncs, then atomically publishes an owner-only snapshot. A per-instance
+advisory lock serializes publication and retention across processes; the next
+run safely removes strictly named owner-owned temporary files left by an
+interrupted attempt. Remote outages are operational states, not local restart
+signals.

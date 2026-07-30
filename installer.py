@@ -327,9 +327,15 @@ def install_systemd(config: BridgeConfig) -> list[str]:
     unit_name = f"codex-telegram-bridge-{config.instance_id}.service"
     health_name = f"codex-telegram-bridge-{config.instance_id}-health.service"
     timer_name = f"codex-telegram-bridge-{config.instance_id}-health.timer"
+    backup_name = f"codex-telegram-bridge-{config.instance_id}-backup.service"
+    backup_timer_name = (
+        f"codex-telegram-bridge-{config.instance_id}-backup.timer"
+    )
     unit_path = user_dir / unit_name
     health_path = user_dir / health_name
     timer_path = user_dir / timer_name
+    backup_path = user_dir / backup_name
+    backup_timer_path = user_dir / backup_timer_name
     cli = runtime_cli(config)
     configuration = config_path(config)
     service_path = os.environ.get(
@@ -343,19 +349,24 @@ def install_systemd(config: BridgeConfig) -> list[str]:
             [
                 "[Unit]",
                 f"Description=Codex Telegram bridge ({config.instance_id})",
-                "After=network-online.target",
-                "Wants=network-online.target",
+                "StartLimitIntervalSec=0",
                 "",
                 "[Service]",
-                "Type=simple",
+                "Type=notify",
                 f"WorkingDirectory={working_directory}",
                 (
                     f"ExecStart={systemd_quote(cli)} --config "
                     f"{systemd_quote(configuration)} serve"
                 ),
                 f"Environment={systemd_quote(f'PATH={service_path}')}",
-                "Restart=on-failure",
-                "RestartSec=10",
+                "Restart=always",
+                "RestartSec=5",
+                "TimeoutStartSec=90",
+                "TimeoutStopSec=90",
+                "KillMode=control-group",
+                "NotifyAccess=main",
+                "WatchdogSec=120",
+                "WatchdogSignal=SIGKILL",
                 "UMask=0077",
                 "NoNewPrivileges=true",
                 "PrivateTmp=true",
@@ -372,15 +383,18 @@ def install_systemd(config: BridgeConfig) -> list[str]:
             [
                 "[Unit]",
                 f"Description=Health check for {config.instance_id}",
+                "StartLimitIntervalSec=0",
                 "",
                 "[Service]",
                 "Type=oneshot",
                 f"WorkingDirectory={working_directory}",
                 (
                     f"ExecStart={systemd_quote(cli)} --config "
-                    f"{systemd_quote(configuration)} doctor"
+                    f"{systemd_quote(configuration)} probe-local"
                 ),
                 f"Environment={systemd_quote(f'PATH={service_path}')}",
+                "TimeoutStartSec=120",
+                "TimeoutStopSec=15",
                 "UMask=0077",
                 "NoNewPrivileges=true",
                 "",
@@ -396,8 +410,8 @@ def install_systemd(config: BridgeConfig) -> list[str]:
                 "",
                 "[Timer]",
                 "OnBootSec=2min",
-                "OnUnitActiveSec=5min",
-                "Persistent=true",
+                "OnUnitInactiveSec=5min",
+                "AccuracySec=30s",
                 f"Unit={health_name}",
                 "",
                 "[Install]",
@@ -407,12 +421,64 @@ def install_systemd(config: BridgeConfig) -> list[str]:
         ),
         encoding="utf-8",
     )
-    for path in (unit_path, health_path, timer_path):
+    backup_path.write_text(
+        "\n".join(
+            [
+                "[Unit]",
+                f"Description=Verified database backup for {config.instance_id}",
+                "StartLimitIntervalSec=0",
+                "",
+                "[Service]",
+                "Type=oneshot",
+                f"WorkingDirectory={working_directory}",
+                (
+                    f"ExecStart={systemd_quote(cli)} --config "
+                    f"{systemd_quote(configuration)} backup --retention 96"
+                ),
+                f"Environment={systemd_quote(f'PATH={service_path}')}",
+                "TimeoutStartSec=120",
+                "TimeoutStopSec=15",
+                "UMask=0077",
+                "NoNewPrivileges=true",
+                "PrivateTmp=true",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    backup_timer_path.write_text(
+        "\n".join(
+            [
+                "[Unit]",
+                f"Description=Periodic database backup for {config.instance_id}",
+                "",
+                "[Timer]",
+                "OnCalendar=*:0/30",
+                "AccuracySec=1min",
+                "RandomizedDelaySec=2min",
+                "Persistent=true",
+                f"Unit={backup_name}",
+                "",
+                "[Install]",
+                "WantedBy=timers.target",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    for path in (
+        unit_path,
+        health_path,
+        timer_path,
+        backup_path,
+        backup_timer_path,
+    ):
         os.chmod(path, 0o644)
     run(["systemctl", "--user", "daemon-reload"])
     run(["systemctl", "--user", "enable", "--now", unit_name])
     run(["systemctl", "--user", "enable", "--now", timer_name])
-    return [unit_name, timer_name]
+    run(["systemctl", "--user", "enable", "--now", backup_timer_name])
+    return [unit_name, timer_name, backup_timer_name]
 
 
 def install_launchd(config: BridgeConfig) -> list[str]:
@@ -422,6 +488,7 @@ def install_launchd(config: BridgeConfig) -> list[str]:
     safe_instance = config.instance_id.replace("-", ".")
     label = f"{SERVICE_PREFIX}.{safe_instance}"
     health_label = f"{label}.health"
+    backup_label = f"{label}.backup"
     cli = str(runtime_cli(config))
     configuration = str(config_path(config))
     common_environment = {
@@ -433,6 +500,7 @@ def install_launchd(config: BridgeConfig) -> list[str]:
     }
     bridge_plist = directory / f"{label}.plist"
     health_plist = directory / f"{health_label}.plist"
+    backup_plist = directory / f"{backup_label}.plist"
     with bridge_plist.open("wb") as stream:
         plistlib.dump(
             {
@@ -446,8 +514,8 @@ def install_launchd(config: BridgeConfig) -> list[str]:
                 "WorkingDirectory": str(config.workspace),
                 "EnvironmentVariables": common_environment,
                 "RunAtLoad": True,
-                "KeepAlive": {"SuccessfulExit": False},
-                "ThrottleInterval": 30,
+                "KeepAlive": True,
+                "ThrottleInterval": 10,
                 "ProcessType": "Background",
                 "StandardOutPath": str(config.state_dir / "service.out.log"),
                 "StandardErrorPath": str(config.state_dir / "service.err.log"),
@@ -463,7 +531,7 @@ def install_launchd(config: BridgeConfig) -> list[str]:
                     cli,
                     "--config",
                     configuration,
-                    "doctor",
+                    "probe-local",
                 ],
                 "WorkingDirectory": str(config.workspace),
                 "EnvironmentVariables": common_environment,
@@ -476,12 +544,37 @@ def install_launchd(config: BridgeConfig) -> list[str]:
             stream,
             sort_keys=True,
         )
+    with backup_plist.open("wb") as stream:
+        plistlib.dump(
+            {
+                "Label": backup_label,
+                "ProgramArguments": [
+                    cli,
+                    "--config",
+                    configuration,
+                    "backup",
+                    "--retention",
+                    "96",
+                ],
+                "WorkingDirectory": str(config.workspace),
+                "EnvironmentVariables": common_environment,
+                "RunAtLoad": True,
+                "StartInterval": 1800,
+                "ProcessType": "Background",
+                "StandardOutPath": str(config.state_dir / "backup.out.log"),
+                "StandardErrorPath": str(config.state_dir / "backup.err.log"),
+            },
+            stream,
+            sort_keys=True,
+        )
     os.chmod(bridge_plist, 0o644)
     os.chmod(health_plist, 0o644)
+    os.chmod(backup_plist, 0o644)
     domain = f"gui/{os.getuid()}"
     for current_label, path in (
         (label, bridge_plist),
         (health_label, health_plist),
+        (backup_label, backup_plist),
     ):
         run(
             [launchctl, "bootout", f"{domain}/{current_label}"],
@@ -489,12 +582,13 @@ def install_launchd(config: BridgeConfig) -> list[str]:
             capture=True,
         )
         run([launchctl, "bootstrap", domain, str(path)])
-    return [label, health_label]
+    return [label, health_label, backup_label]
 
 
 def bridge_command(
     config: BridgeConfig,
     command: str,
+    *arguments: str,
 ) -> subprocess.CompletedProcess[str]:
     return run(
         [
@@ -502,6 +596,7 @@ def bridge_command(
             "--config",
             str(config_path(config)),
             command,
+            *arguments,
         ],
         capture=True,
     )
@@ -513,6 +608,7 @@ def activate(args: argparse.Namespace) -> dict[str, Any]:
         raise InstallerError("Prepared runtime is missing; run prepare first")
     bridge_command(config, "sync-once")
     bridge_command(config, "doctor")
+    bridge_command(config, "backup", "--retention", "96")
     services = (
         install_launchd(config)
         if sys.platform == "darwin"
@@ -533,7 +629,7 @@ def deactivate(args: argparse.Namespace) -> dict[str, Any]:
         launchctl = shutil.which("launchctl") or "/bin/launchctl"
         safe_instance = config.instance_id.replace("-", ".")
         label = f"{SERVICE_PREFIX}.{safe_instance}"
-        labels = (label, f"{label}.health")
+        labels = (label, f"{label}.health", f"{label}.backup")
         domain = f"gui/{os.getuid()}"
         directory = Path.home() / "Library" / "LaunchAgents"
         for current_label in labels:
@@ -549,6 +645,7 @@ def deactivate(args: argparse.Namespace) -> dict[str, Any]:
         unit_names = (
             f"codex-telegram-bridge-{config.instance_id}.service",
             f"codex-telegram-bridge-{config.instance_id}-health.timer",
+            f"codex-telegram-bridge-{config.instance_id}-backup.timer",
         )
         for unit in unit_names:
             run(
@@ -560,6 +657,7 @@ def deactivate(args: argparse.Namespace) -> dict[str, Any]:
         for name in (
             *unit_names,
             f"codex-telegram-bridge-{config.instance_id}-health.service",
+            f"codex-telegram-bridge-{config.instance_id}-backup.service",
         ):
             (directory / name).unlink(missing_ok=True)
             removed.append(name)

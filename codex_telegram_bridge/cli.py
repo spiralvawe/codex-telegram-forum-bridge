@@ -26,7 +26,12 @@ from .service import (
     FINAL_ANSWER_CUSTOM_EMOJI_ALT,
     FINAL_ANSWER_CUSTOM_EMOJI_SETTING,
 )
-from .store import BridgeStore, CURRENT_SCHEMA_VERSION
+from .store import (
+    OPERATIONAL_BACKUP_RETENTION,
+    BridgeStore,
+    CURRENT_SCHEMA_VERSION,
+)
+from .systemd_notify import SystemdNotifier
 from .telegram import TelegramAPI, TelegramError
 
 
@@ -167,6 +172,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="Wait for /connect for up to this many seconds.",
     )
     subparsers.add_parser("doctor", help="Run read-only configuration checks.")
+    backup = subparsers.add_parser(
+        "backup",
+        help="Create and verify an online backup of the bridge database.",
+    )
+    backup.add_argument(
+        "--retention",
+        type=int,
+        default=OPERATIONAL_BACKUP_RETENTION,
+        help="Number of operational database backups to retain.",
+    )
+    subparsers.add_parser(
+        "probe-local",
+        help="Check only local database and Codex app-server health.",
+    )
     final_icon = subparsers.add_parser(
         "setup-final-icon",
         help="Create/reuse the Codex custom emoji for final answers.",
@@ -335,6 +354,68 @@ def doctor_database_health(store: BridgeStore) -> dict[str, Any]:
         ),
         "pendingArchiveDeletions": pending_archive_deletions,
     }
+
+
+def run_operational_backup(
+    store: BridgeStore,
+    *,
+    retention: int,
+) -> dict[str, Any]:
+    backup = store.create_operational_backup(retention=retention)
+    return {
+        "ok": True,
+        "path": str(backup.path),
+        "createdAt": backup.created_at,
+        "schemaVersion": backup.schema_version,
+        "sizeBytes": backup.size_bytes,
+        "retainedBackups": backup.retained_backups,
+        "prunedBackups": backup.pruned_backups,
+    }
+
+
+async def run_local_probe(
+    config: BridgeConfig,
+    store: BridgeStore,
+) -> dict[str, Any]:
+    database = doctor_database_health(store)
+
+    async def ignore(_: dict[str, Any]) -> None:
+        return None
+
+    app_server = CodexAppServer(
+        codex_binary=config.codex_binary,
+        cwd=str(config.workspace),
+        on_notification=ignore,
+        on_server_request=ignore,
+        socket_path=config.codex_app_server_socket,
+        compatible_versions=config.compatible_codex_versions,
+        full_access=config.codex_full_access,
+    )
+    app_server_healthy = False
+    error_type: str | None = None
+    try:
+        await app_server.start()
+        response = await app_server.request("config/read", {}, timeout=10)
+        app_server_healthy = isinstance(response.get("config"), dict)
+    except Exception as error:
+        error_type = type(error).__name__
+    finally:
+        with contextlib.suppress(Exception):
+            await app_server.stop()
+
+    result: dict[str, Any] = {
+        **database,
+        "codexAppServer": app_server_healthy,
+        "codexProtocolSmoke": app_server_healthy,
+    }
+    if error_type is not None:
+        result["errorType"] = error_type
+    result["ok"] = bool(
+        database["databaseIntegrity"] == "ok"
+        and database["databaseSchemaVersion"] == CURRENT_SCHEMA_VERSION
+        and app_server_healthy
+    )
+    return result
 
 
 def doctor_media_health(config: BridgeConfig) -> dict[str, bool]:
@@ -647,11 +728,25 @@ async def run_serve(
 ) -> None:
     store.acquire_service_lock()
     service = BridgeService(config=config, store=store, telegram=telegram)
+    notifier = SystemdNotifier.from_environment()
     loop = asyncio.get_running_loop()
     for signal_name in (signal.SIGINT, signal.SIGTERM):
         with contextlib.suppress(NotImplementedError):
             loop.add_signal_handler(signal_name, service.stop)
-    await service.serve()
+    watchdog_task = asyncio.create_task(
+        notifier.watchdog_loop(),
+        name="systemd-watchdog-loop",
+    )
+    try:
+        await service.serve(
+            on_ready=lambda: notifier.notify(
+                "READY=1\nSTATUS=Codex Telegram bridge is running"
+            )
+        )
+    finally:
+        watchdog_task.cancel()
+        await asyncio.gather(watchdog_task, return_exceptions=True)
+        notifier.notify("STOPPING=1\nSTATUS=Codex Telegram bridge is stopping")
 
 
 def configure_logging(
@@ -705,6 +800,33 @@ def main(argv: list[str] | None = None) -> int:
             else None
         ),
     )
+    if args.command in {"backup", "probe-local"}:
+        local_store: BridgeStore | None = None
+        try:
+            local_store = BridgeStore(
+                configured_config.database_path,
+                read_only=True,
+            )
+            if args.command == "backup":
+                result = run_operational_backup(
+                    local_store,
+                    retention=int(args.retention),
+                )
+            else:
+                result = asyncio.run(
+                    run_local_probe(configured_config, local_store)
+                )
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            return 0 if result.get("ok") else 2
+        except KeyboardInterrupt:
+            return 130
+        except Exception as error:
+            LOGGER.error("%s", error)
+            return 1
+        finally:
+            if local_store is not None:
+                local_store.close()
+
     config, store, telegram = create_runtime(
         args,
         read_only=args.command == "doctor",

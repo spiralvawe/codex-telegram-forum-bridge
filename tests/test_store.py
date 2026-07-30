@@ -18,6 +18,9 @@ sys.path.insert(0, str(ROOT))
 from codex_telegram_bridge.store import (  # noqa: E402
     CURRENT_SCHEMA_VERSION,
     MIGRATION_BACKUP_RETENTION,
+    OPERATIONAL_BACKUP_LOCK_NAME,
+    OPERATIONAL_BACKUP_MAX_RETENTION,
+    OPERATIONAL_BACKUP_NAME,
     BridgeStore,
     SchemaVersionError,
 )
@@ -1051,6 +1054,183 @@ class StoreTests(unittest.TestCase):
         self.assertTrue(
             all(path.stat().st_mode & 0o777 == 0o600 for path in backups)
         )
+
+    def test_operational_backup_is_verified_readable_and_owner_only(
+        self,
+    ) -> None:
+        self.store.set_setting("operational-backup-marker", "preserved")
+
+        read_only_source = BridgeStore(self.store.path, read_only=True)
+        try:
+            result = read_only_source.create_operational_backup()
+        finally:
+            read_only_source.close()
+
+        self.assertTrue(result.path.is_file())
+        self.assertIsNotNone(OPERATIONAL_BACKUP_NAME.fullmatch(result.path.name))
+        self.assertEqual(result.schema_version, CURRENT_SCHEMA_VERSION)
+        self.assertGreater(result.size_bytes, 0)
+        self.assertEqual(result.retained_backups, 1)
+        self.assertEqual(result.pruned_backups, 0)
+        self.assertEqual(result.path.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(result.path.parent.stat().st_mode & 0o777, 0o700)
+
+        backup = sqlite3.connect(
+            f"{result.path.resolve().as_uri()}?mode=ro",
+            uri=True,
+        )
+        try:
+            self.assertEqual(
+                backup.execute("PRAGMA integrity_check").fetchone()[0],
+                "ok",
+            )
+            self.assertEqual(
+                backup.execute(
+                    "SELECT value FROM settings WHERE key = ?",
+                    ("operational-backup-marker",),
+                ).fetchone()[0],
+                "preserved",
+            )
+            self.assertEqual(
+                backup.execute("PRAGMA user_version").fetchone()[0],
+                CURRENT_SCHEMA_VERSION,
+            )
+        finally:
+            backup.close()
+
+        self.store.set_setting("source-remains-online", "yes")
+        self.assertEqual(self.store.get_setting("source-remains-online"), "yes")
+
+    def test_operational_backup_retention_prunes_only_exact_safe_names(
+        self,
+    ) -> None:
+        migration = self.store._create_migration_backup(  # noqa: SLF001
+            CURRENT_SCHEMA_VERSION,
+            CURRENT_SCHEMA_VERSION + 1,
+        )
+        backup_directory = migration.parent
+        unrelated = backup_directory / "bridge-operational-manual.sqlite3"
+        unrelated.write_text("keep", encoding="utf-8")
+        symlink = backup_directory / (
+            "bridge-operational-v5-20000101T000000000000Z-deadbeef.sqlite3"
+        )
+        symlink.symlink_to(unrelated)
+
+        results = [
+            self.store.create_operational_backup(retention=2)
+            for _ in range(4)
+        ]
+
+        retained = [
+            path
+            for path in backup_directory.iterdir()
+            if OPERATIONAL_BACKUP_NAME.fullmatch(path.name)
+            and not path.is_symlink()
+        ]
+        self.assertEqual(len(retained), 2)
+        self.assertTrue(
+            all(path.stat().st_mode & 0o777 == 0o600 for path in retained)
+        )
+        self.assertEqual(results[-1].retained_backups, 2)
+        self.assertEqual(results[-1].pruned_backups, 1)
+        self.assertTrue(all(not result.path.exists() for result in results[:2]))
+        self.assertTrue(all(result.path.exists() for result in results[2:]))
+        self.assertTrue(migration.exists())
+        self.assertTrue(unrelated.exists())
+        self.assertTrue(symlink.is_symlink())
+
+    def test_operational_backup_serializes_concurrent_creators(self) -> None:
+        barrier = Barrier(32)
+
+        def create(_: int):
+            source = BridgeStore(self.store.path, read_only=True)
+            try:
+                barrier.wait(timeout=10)
+                return source.create_operational_backup(retention=1)
+            finally:
+                source.close()
+
+        with ThreadPoolExecutor(max_workers=32) as executor:
+            results = list(executor.map(create, range(32)))
+
+        retained = [
+            path
+            for path in (self.store.path.parent / "backups").iterdir()
+            if OPERATIONAL_BACKUP_NAME.fullmatch(path.name)
+            and not path.is_symlink()
+        ]
+        self.assertEqual(len(results), 32)
+        self.assertEqual(len(retained), 1)
+        self.assertEqual(retained[0].stat().st_mode & 0o777, 0o600)
+
+    def test_operational_backup_cleans_only_owned_stale_temps(self) -> None:
+        backup_directory = self.store.path.parent / "backups"
+        self.store._ensure_private_backup_directory(  # noqa: SLF001
+            backup_directory
+        )
+        stale_names = (
+            ".bridge-operational-deadbeef.tmp",
+            ".bridge-operational-deadbeef.tmp-journal",
+            ".bridge-operational-deadbeef.tmp-wal",
+            ".bridge-operational-deadbeef.tmp-shm",
+        )
+        for name in stale_names:
+            path = backup_directory / name
+            path.write_bytes(b"interrupted")
+            path.chmod(0o600)
+        unrelated = backup_directory / ".bridge-operational-deadbeef.tmp-extra"
+        unrelated.write_bytes(b"keep")
+        symlink_target = backup_directory / "unrelated"
+        symlink_target.write_bytes(b"keep")
+        symlink = backup_directory / ".bridge-operational-feedface.tmp"
+        symlink.symlink_to(symlink_target)
+
+        self.store.create_operational_backup()
+
+        self.assertTrue(
+            all(not (backup_directory / name).exists() for name in stale_names)
+        )
+        self.assertTrue(unrelated.exists())
+        self.assertTrue(symlink.is_symlink())
+        self.assertTrue(symlink_target.exists())
+
+    def test_operational_backup_validation_failure_cleans_private_temp(
+        self,
+    ) -> None:
+        self.store.set_setting("source-marker", "unchanged")
+
+        with mock.patch.object(
+            BridgeStore,
+            "_validate_backup_file",
+            side_effect=sqlite3.DatabaseError("injected validation failure"),
+        ):
+            with self.assertRaisesRegex(
+                sqlite3.DatabaseError,
+                "injected validation failure",
+            ):
+                self.store.create_operational_backup()
+
+        backup_directory = self.store.path.parent / "backups"
+        self.assertTrue(backup_directory.is_dir())
+        self.assertEqual(
+            [path.name for path in backup_directory.iterdir()],
+            [OPERATIONAL_BACKUP_LOCK_NAME],
+        )
+        self.assertEqual(
+            (backup_directory / OPERATIONAL_BACKUP_LOCK_NAME).stat().st_mode
+            & 0o777,
+            0o600,
+        )
+        self.assertEqual(self.store.get_setting("source-marker"), "unchanged")
+        self.assertEqual(self.store.integrity_check(), "ok")
+
+    def test_operational_backup_retention_rejects_unbounded_values(
+        self,
+    ) -> None:
+        for invalid in (True, 0, -1, OPERATIONAL_BACKUP_MAX_RETENTION + 1):
+            with self.subTest(retention=invalid):
+                with self.assertRaises(ValueError):
+                    self.store.create_operational_backup(retention=invalid)
 
     def test_queue_lifecycle(self) -> None:
         queued = self.store.enqueue(

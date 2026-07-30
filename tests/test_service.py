@@ -1628,6 +1628,75 @@ class ServiceRoutingTests(unittest.IsolatedAsyncioTestCase):
         )
         self.codex.start_turn.assert_not_awaited()
 
+    async def test_force_reply_voice_defers_title_until_codex_transcribes(
+        self,
+    ) -> None:
+        audio = self.local_media_input()
+        update = self.topic_media_message(
+            "voice",
+            reply_to_message={
+                "message_id": 89,
+                "text": NEW_THREAD_PROMPT,
+                "from": {"id": 700, "is_bot": True},
+            },
+        )
+        self.service._prepare_telegram_media = AsyncMock(  # type: ignore[method-assign]
+            return_value=("🎙 Голосовой запрос", (audio,))
+        )
+        self.service.create_thread_from_general = AsyncMock()
+
+        await self.service.handle_telegram_update(update)
+
+        self.service.create_thread_from_general.assert_awaited_once_with(
+            "🎙 Голосовой запрос",
+            source_message_id=90,
+            local_inputs=(audio,),
+            defer_title_to_codex=True,
+        )
+
+    async def test_new_voice_thread_does_not_preempt_native_codex_title(
+        self,
+    ) -> None:
+        audio = self.local_media_input()
+        new_topic = TopicBinding(
+            thread_id="thread-voice",
+            chat_id=-100500,
+            topic_id=60,
+            title="Распознаётся голосовая задача",
+            archived=False,
+            last_updated_at=0,
+        )
+        self.codex.start_thread = AsyncMock(
+            return_value={"id": "thread-voice", "updatedAt": 123}
+        )
+        self.codex.set_thread_name = AsyncMock()
+        self.service._refresh_thread_mode = AsyncMock(return_value=None)
+        self.service._create_topic_for_thread = AsyncMock(
+            return_value=new_topic
+        )
+        self.service.start_turn = AsyncMock(return_value=True)
+
+        await self.service.create_thread_from_general(
+            "🎙 Голосовой запрос",
+            source_message_id=100,
+            local_inputs=(audio,),
+            defer_title_to_codex=True,
+        )
+
+        self.codex.set_thread_name.assert_not_awaited()
+        self.service._create_topic_for_thread.assert_awaited_once_with(
+            thread_id="thread-voice",
+            title="Распознаётся голосовая задача",
+            updated_at=123,
+        )
+        self.service.start_turn.assert_awaited_once_with(
+            topic=new_topic,
+            text="🎙 Голосовой запрос",
+            client_id="tg:-100500:100",
+            reply_to=801,
+            local_inputs=(audio,),
+        )
+
     async def test_new_thread_replay_does_not_duplicate_thread_or_turn(
         self,
     ) -> None:

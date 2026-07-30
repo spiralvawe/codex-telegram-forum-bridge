@@ -244,6 +244,8 @@ class DoctorDesktopDetectionTests(unittest.TestCase):
             unsafe = doctor_media_health(config)
 
         self.assertTrue(ready["mediaInputReady"])
+        self.assertFalse(ready["mediaWorkerConfigured"])
+        self.assertFalse(ready["mediaWorkerRequired"])
         self.assertFalse(unsafe["mediaStorageOwnerOnly"])
         self.assertFalse(unsafe["mediaInputReady"])
 

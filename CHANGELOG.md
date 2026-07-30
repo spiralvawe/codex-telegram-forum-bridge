@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+## 0.4.0 — 2026-07-30
+
+- Add an opt-in, mutually authenticated LAN media worker for bounded FFmpeg
+  preparation. The bridge validates and materializes returned artifacts
+  locally and uses a retry circuit breaker. Infrastructure, transport,
+  capacity, protocol, timeout, and unsupported-capability failures fall back
+  to local FFmpeg; authenticated terminal invalid-media results deliberately
+  do not repeat the same work locally. The worker is not a readiness or
+  service dependency.
+- Keep the worker identity and configuration separate from Telegram, Codex,
+  password-manager, sudo, and full-access main-user SSH credentials.
+- Add bounded TLS/request/processing/shutdown deadlines, a durable idempotent
+  spool, atomic owner-only output, startup residue cleanup, fail-fast worker
+  supervision, and restart-on-boot service templates for a dedicated account.
+- Bound FFmpeg pixels, allocation size, codec/filter threads, output, and
+  process-group physical footprint. Linux uses strict cgroup `MemoryMax`;
+  native macOS uses a documented best-effort public-libproc watchdog because
+  its resident-set service limit is advisory.
+- Support explicit all-interface mTLS listeners for multi-interface/DHCP
+  failover, with documented firewall scope, rotating sanitized worker logs,
+  strict configuration schemas, resource-limited service definitions, and
+  prepare-plus-activate local-only rollback.
+- Install correctly from a wheel outside the source checkout, preserve the
+  exact existing instance/runtime policy during media-worker updates, and
+  require activation to verify, back up, reload, and restart the bridge.
+
 ## 0.3.0 — 2026-07-30
 
 - Supervise the three critical bridge loops as one failure domain. An

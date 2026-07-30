@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import ipaddress
+import math
 import os
 import re
 import shutil
@@ -22,6 +24,24 @@ DEFAULT_CODEX_APP_SERVER_SOCKET = (
 )
 TELEGRAM_CLOUD_DOWNLOAD_LIMIT_BYTES = 20 * 1024 * 1024
 SECRET_BACKENDS = frozenset({"macos-keychain", "proton-pass", "file"})
+MEDIA_WORKER_REQUIRED_FIELDS = frozenset(
+    {
+        "host",
+        "port",
+        "server_name",
+        "ca_certificate",
+        "client_certificate",
+        "client_key",
+    }
+)
+MEDIA_WORKER_OPTIONAL_FIELDS = frozenset(
+    {
+        "request_timeout_seconds",
+        "processing_timeout_seconds",
+        "failure_threshold",
+        "cooldown_seconds",
+    }
+)
 
 
 def default_state_root() -> Path:
@@ -81,6 +101,190 @@ def default_secret_backend() -> str:
     return "file"
 
 
+def _validated_media_worker_name(value: object, *, field: str) -> str:
+    name = str(value).strip()
+    if (
+        not name
+        or len(name) > 253
+        or any(character.isspace() for character in name)
+        or any(character in name for character in ("/", "\\", "\x00"))
+    ):
+        raise ValueError(f"media worker {field} is invalid")
+    try:
+        ipaddress.ip_address(name)
+    except ValueError:
+        try:
+            ascii_name = name.encode("idna").decode("ascii")
+        except UnicodeError:
+            raise ValueError(f"media worker {field} is invalid") from None
+        labels = ascii_name.split(".")
+        if any(
+            not label
+            or len(label) > 63
+            or not label[0].isalnum()
+            or not label[-1].isalnum()
+            or any(
+                not (character.isalnum() or character == "-")
+                for character in label
+            )
+            for label in labels
+        ):
+            raise ValueError(f"media worker {field} is invalid")
+        name = ascii_name
+    return name
+
+
+@dataclass(frozen=True)
+class MediaWorkerClientConfig:
+    """Connection metadata for one optional, least-privilege media worker."""
+
+    host: str
+    port: int
+    server_name: str
+    ca_certificate: Path
+    client_certificate: Path
+    client_key: Path
+    request_timeout_seconds: float = 30.0
+    processing_timeout_seconds: float = 180.0
+    failure_threshold: int = 3
+    cooldown_seconds: float = 300.0
+
+    def __post_init__(self) -> None:
+        host = _validated_media_worker_name(self.host, field="host")
+        server_name = _validated_media_worker_name(
+            self.server_name,
+            field="TLS server name",
+        )
+        if (
+            isinstance(self.port, bool)
+            or not isinstance(self.port, int)
+            or not 1 <= self.port <= 65535
+        ):
+            raise ValueError("media worker port must be between 1 and 65535")
+        request_timeout = float(self.request_timeout_seconds)
+        if not math.isfinite(request_timeout) or not 1 <= request_timeout <= 60:
+            raise ValueError(
+                "media worker request timeout must be between 1 and 60 seconds"
+            )
+        processing_timeout = float(self.processing_timeout_seconds)
+        if (
+            not math.isfinite(processing_timeout)
+            or not 1 <= processing_timeout <= 300
+        ):
+            raise ValueError(
+                "media worker processing timeout must be between 1 and "
+                "300 seconds"
+            )
+        if (
+            isinstance(self.failure_threshold, bool)
+            or not isinstance(self.failure_threshold, int)
+            or not 1 <= self.failure_threshold <= 10
+        ):
+            raise ValueError(
+                "media worker failure threshold must be between 1 and 10"
+            )
+        cooldown = float(self.cooldown_seconds)
+        if not math.isfinite(cooldown) or not 1 <= cooldown <= 3600:
+            raise ValueError(
+                "media worker cooldown must be between 1 and 3600 seconds"
+            )
+        object.__setattr__(self, "host", host)
+        object.__setattr__(self, "server_name", server_name)
+        object.__setattr__(self, "request_timeout_seconds", request_timeout)
+        object.__setattr__(
+            self,
+            "processing_timeout_seconds",
+            processing_timeout,
+        )
+        object.__setattr__(self, "cooldown_seconds", cooldown)
+        for field_name in (
+            "ca_certificate",
+            "client_certificate",
+            "client_key",
+        ):
+            path = Path(
+                os.path.abspath(Path(getattr(self, field_name)).expanduser())
+            )
+            object.__setattr__(self, field_name, path)
+
+    @classmethod
+    def from_payload(
+        cls,
+        payload: dict[str, Any],
+    ) -> "MediaWorkerClientConfig":
+        unknown = set(payload) - (
+            MEDIA_WORKER_REQUIRED_FIELDS | MEDIA_WORKER_OPTIONAL_FIELDS
+        )
+        if unknown:
+            raise ValueError(
+                "media worker configuration contains unsupported fields: "
+                + ", ".join(sorted(unknown))
+            )
+        missing = MEDIA_WORKER_REQUIRED_FIELDS - set(payload)
+        if missing:
+            raise ValueError(
+                "media worker configuration is missing: "
+                + ", ".join(sorted(missing))
+            )
+        return cls(
+            host=str(payload["host"]),
+            port=payload["port"],
+            server_name=str(payload["server_name"]),
+            ca_certificate=Path(str(payload["ca_certificate"])),
+            client_certificate=Path(str(payload["client_certificate"])),
+            client_key=Path(str(payload["client_key"])),
+            request_timeout_seconds=float(
+                payload.get("request_timeout_seconds", 30)
+            ),
+            processing_timeout_seconds=float(
+                payload.get("processing_timeout_seconds", 180)
+            ),
+            failure_threshold=payload.get("failure_threshold", 3),
+            cooldown_seconds=float(payload.get("cooldown_seconds", 300)),
+        )
+
+    @classmethod
+    def from_file(
+        cls,
+        path: str | Path,
+    ) -> "MediaWorkerClientConfig":
+        requested_path = Path(path).expanduser()
+        if requested_path.is_symlink():
+            raise ValueError(
+                "media worker client configuration must not be a symlink"
+            )
+        status = requested_path.stat()
+        if (
+            not stat.S_ISREG(status.st_mode)
+            or status.st_uid != os.getuid()
+            or stat.S_IMODE(status.st_mode) & 0o077
+        ):
+            raise ValueError(
+                "media worker client configuration must be an owner-only "
+                "regular file"
+            )
+        payload = json.loads(requested_path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError(
+                "media worker client configuration must be a JSON object"
+            )
+        return cls.from_payload(payload)
+
+    def as_file_payload(self) -> dict[str, Any]:
+        return {
+            "host": self.host,
+            "port": self.port,
+            "server_name": self.server_name,
+            "ca_certificate": str(self.ca_certificate),
+            "client_certificate": str(self.client_certificate),
+            "client_key": str(self.client_key),
+            "request_timeout_seconds": self.request_timeout_seconds,
+            "processing_timeout_seconds": self.processing_timeout_seconds,
+            "failure_threshold": self.failure_threshold,
+            "cooldown_seconds": self.cooldown_seconds,
+        }
+
+
 @dataclass(frozen=True)
 class BridgeConfig:
     workspace: Path
@@ -104,6 +308,7 @@ class BridgeConfig:
     media_retention_days: int = 30
     media_storage_limit_bytes: int = 512 * 1024 * 1024
     telegram_media_max_bytes: int = TELEGRAM_CLOUD_DOWNLOAD_LIMIT_BYTES
+    media_worker: MediaWorkerClientConfig | None = None
 
     def __post_init__(self) -> None:
         backend = self.secret_backend.strip().casefold()
@@ -125,6 +330,13 @@ class BridgeConfig:
             )
         if not isinstance(self.codex_full_access, bool):
             raise ValueError("codex_full_access must be a boolean")
+        if self.media_worker is not None and not isinstance(
+            self.media_worker,
+            MediaWorkerClientConfig,
+        ):
+            raise ValueError(
+                "media_worker must be a MediaWorkerClientConfig or null"
+            )
 
     @property
     def database_path(self) -> Path:
@@ -151,6 +363,7 @@ class BridgeConfig:
         secret_vault: str | None = None,
         max_active_turns: int | None = None,
         codex_full_access: bool = False,
+        media_worker: MediaWorkerClientConfig | None = None,
     ) -> "BridgeConfig":
         workspace_path = Path(workspace).expanduser().resolve()
         selected_instance = (
@@ -221,6 +434,7 @@ class BridgeConfig:
                 )
             ),
             codex_full_access=codex_full_access,
+            media_worker=media_worker,
             ffmpeg_binary=detect_ffmpeg_binary(),
             media_processing_timeout_seconds=float(
                 os.environ.get(
@@ -293,6 +507,12 @@ class BridgeConfig:
                 f"Bridge configuration is missing: {', '.join(missing)}"
             )
         versions = payload.get("compatible_codex_versions")
+        media_worker_payload = payload.get("media_worker")
+        if media_worker_payload is not None and not isinstance(
+            media_worker_payload,
+            dict,
+        ):
+            raise ValueError("media worker configuration must be an object")
         return cls(
             workspace=Path(str(payload["workspace"])).expanduser().resolve(),
             state_dir=Path(str(payload["state_dir"])).expanduser().resolve(),
@@ -365,6 +585,11 @@ class BridgeConfig:
                     ),
                 ),
             ),
+            media_worker=(
+                MediaWorkerClientConfig.from_payload(media_worker_payload)
+                if isinstance(media_worker_payload, dict)
+                else None
+            ),
         )
 
     def as_file_payload(self) -> dict[str, Any]:
@@ -394,6 +619,11 @@ class BridgeConfig:
             "media_retention_days": self.media_retention_days,
             "media_storage_limit_bytes": self.media_storage_limit_bytes,
             "telegram_media_max_bytes": self.telegram_media_max_bytes,
+            "media_worker": (
+                self.media_worker.as_file_payload()
+                if self.media_worker is not None
+                else None
+            ),
         }
 
 

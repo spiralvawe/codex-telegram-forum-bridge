@@ -8,6 +8,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -18,6 +19,7 @@ from codex_telegram_bridge.input_types import (  # noqa: E402
     normalize_local_inputs,
 )
 from codex_telegram_bridge.media import (  # noqa: E402
+    MediaProcessingError,
     MediaProcessor,
     PreparedDocument,
     PreparedMedia,
@@ -66,6 +68,38 @@ class LocalInputTests(unittest.TestCase):
                 "name": "report.csv",
             },
         )
+
+
+class MediaSecurityTests(unittest.TestCase):
+    def test_local_processor_rejects_playlist_before_ffmpeg(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = root / "ffmpeg"
+            binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            binary.chmod(0o700)
+            processor = MediaProcessor(
+                root=root / "media",
+                ffmpeg_binary=binary,
+            )
+            source = processor.source_path("8" * 32)
+            source.write_bytes(
+                b"#EXTM3U\nhttp://192.168.1.1/private\n"
+            )
+            source.chmod(0o600)
+
+            with mock.patch(
+                "codex_telegram_bridge.media.subprocess.run"
+            ) as run:
+                with self.assertRaisesRegex(
+                    MediaProcessingError,
+                    "invalid_audio",
+                ):
+                    processor.prepare_voice(
+                        media_key="8" * 32,
+                        source_path=source,
+                        duration_seconds=1,
+                    )
+            run.assert_not_called()
 
 
 @unittest.skipUnless(FFMPEG.is_file(), "ffmpeg is required for media tests")

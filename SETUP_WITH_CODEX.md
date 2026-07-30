@@ -217,3 +217,57 @@ snapshots. UPS power, storage health, host/network watchdogs, Wi-Fi policy,
 thermal management, and encrypted off-host backup are machine-specific and
 must be assessed separately. A same-disk snapshot does not survive loss of the
 host or storage device.
+
+## 10. Optional media worker
+
+Configure the LAN media worker only when the owner explicitly requests it.
+Read `docs/MEDIA_WORKER.md` completely. Before issuing certificates or loading
+a boot service, obtain approval for the dedicated non-login account, stable
+DNS/mDNS name, port, CA lifetime/storage, retention period, and system paths.
+
+Never reuse the main user's SSH/Codex identity or put Telegram, Codex, Home
+Assistant, Proton Pass, sudo, or shell-login credentials in the worker. Run the
+worker renderer and `probe-config` as the verified service account. On Linux,
+require primary-group-only membership. On macOS, permit only the reviewed
+automatic `everyone`, `localaccounts`, `_lpoperator`, and
+`com.apple.sharepoint.group.N` groups; reject administrative, remote-access,
+custom, and root-equivalent membership on every platform. Keep
+Python/package/FFmpeg immutable to that account and retain the generated
+process, memory, file-size, open-file, restart, and spool limits.
+
+On native macOS keep worker concurrency at one. Verify that the FFmpeg command
+retains the pixel, single-allocation, decoder/encoder/filter-thread, output,
+and 512 MiB physical-footprint watchdog controls. State explicitly that
+launchd's resident-set setting is advisory and the watchdog is best-effort;
+only Linux `MemoryMax` or a capped Linux VM provides a strict memory boundary.
+Accept the remaining native-Mac denial-of-service risk only for a private,
+trusted Telegram group.
+
+When changing a prepared bridge, read its current configuration and pass the
+same absolute workspace, `--instance`, and `--state-dir` to `prepare`. Never
+derive a new instance for an existing Telegram bot:
+
+```sh
+codex-telegram-bridge-installer prepare \
+  --workspace "/exact/existing/workspace" \
+  --instance EXISTING_INSTANCE \
+  --state-dir "/exact/existing/state" \
+  --media-worker-client-config "/owner-only/client.json"
+```
+
+Run the exact `activate --config` command returned by `prepare`. Preparation
+does not reload an already running service; activation performs `doctor`,
+creates a verified backup, and restarts/reloads the service. The same two-step
+prepare-plus-activate rule applies to `--disable-media-worker`.
+
+After activation, stop the worker and prove that one harmless media request
+completes through local FFmpeg; then restart the worker and repeat it remotely.
+Transport, TLS, capacity, timeout, protocol, malformed-output, and unsupported
+capability failures must fall back locally. An authenticated terminal
+`MediaProcessingError` is intentionally not retried locally.
+
+Record both leaf-certificate expiries, check for renewal starting 90 days
+before expiry, and complete replacement by 60 days before expiry. Do not
+hardcode one deployment's expiry in this universal repository. Keep the CA
+private key offline between issuance events. A worker failure or certificate
+maintenance event must never fail bridge readiness or restart the bridge.

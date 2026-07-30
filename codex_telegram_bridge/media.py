@@ -17,12 +17,76 @@ from .input_types import LocalInput
 MEDIA_KEY_PATTERN = re.compile(r"[0-9a-f]{32}")
 DEFAULT_RETENTION_SECONDS = 30 * 24 * 60 * 60
 DEFAULT_STORAGE_LIMIT_BYTES = 512 * 1024 * 1024
+SAFE_FFMPEG_PROTOCOLS = "file"
 
 
 class MediaProcessingError(RuntimeError):
     def __init__(self, kind: str):
         super().__init__(kind)
         self.kind = kind
+
+
+def _safe_ffmpeg_input_format(
+    source_path: str | Path,
+    *,
+    kind: str,
+) -> str:
+    """Select a fixed demuxer from bounded magic instead of auto-detection."""
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(Path(source_path), flags)
+    except OSError:
+        raise MediaProcessingError("invalid_media") from None
+    try:
+        status = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(status.st_mode)
+            or status.st_uid != os.getuid()
+            or status.st_size <= 0
+        ):
+            raise MediaProcessingError("invalid_media")
+        head = os.read(descriptor, 32)
+    finally:
+        os.close(descriptor)
+
+    is_iso_bmff = (
+        len(head) >= 12
+        and head[4:8] == b"ftyp"
+        and int.from_bytes(head[:4], "big") >= 8
+    )
+    if kind in {"video", "video_note"}:
+        if is_iso_bmff:
+            return "mov"
+        raise MediaProcessingError("invalid_video")
+    if kind != "voice":
+        raise MediaProcessingError("invalid_media")
+    if head.startswith(b"OggS"):
+        return "ogg"
+    if head.startswith(b"ID3") or (
+        len(head) >= 2
+        and head[0] == 0xFF
+        and head[1] & 0xE0 == 0xE0
+        and head[1] & 0x06 != 0
+    ):
+        return "mp3"
+    if is_iso_bmff:
+        return "mov"
+    raise MediaProcessingError("invalid_audio")
+
+
+def _ffmpeg_input_options(input_format: str) -> list[str]:
+    options = [
+        "-protocol_whitelist",
+        SAFE_FFMPEG_PROTOCOLS,
+        "-f",
+        input_format,
+    ]
+    if input_format == "mov":
+        # Keep ISO-BMFF data references inside the supplied media file.
+        options.extend(["-enable_drefs", "0", "-use_absolute_path", "0"])
+    return options
 
 
 @dataclass(frozen=True)
@@ -233,6 +297,7 @@ class MediaProcessor:
         source = self._validated_source(source_path, directory)
         audio = directory / "audio.mp3"
         if not self._usable_file(audio):
+            input_format = _safe_ffmpeg_input_format(source, kind="voice")
             self._run_ffmpeg(
                 [
                     "-i",
@@ -249,6 +314,7 @@ class MediaProcessor:
                 ],
                 audio,
                 error_kind="invalid_audio",
+                input_format=input_format,
             )
         self._touch_directory(directory)
         return PreparedMedia(
@@ -298,10 +364,17 @@ class MediaProcessor:
         directory = self.message_directory(media_key)
         source = self._validated_source(source_path, directory)
         duration = max(0, int(duration_seconds))
+        input_format = _safe_ffmpeg_input_format(source, kind=kind)
+        deadline = time.monotonic() + self.timeout_seconds
         inputs: list[LocalInput] = []
 
         audio = directory / "audio.mp3"
-        if self._usable_file(audio) or self._try_video_audio(source, audio):
+        if self._usable_file(audio) or self._try_video_audio(
+            source,
+            audio,
+            input_format=input_format,
+            deadline=deadline,
+        ):
             inputs.append(LocalInput("localAudio", str(audio.resolve())))
 
         positions = self._frame_positions(duration)
@@ -324,6 +397,8 @@ class MediaProcessor:
                     ],
                     frame,
                     error_kind="invalid_video",
+                    input_format=input_format,
+                    deadline=deadline,
                 )
             inputs.append(
                 LocalInput(
@@ -407,7 +482,14 @@ class MediaProcessor:
         os.chmod(resolved, 0o600)
         return resolved
 
-    def _try_video_audio(self, source: Path, destination: Path) -> bool:
+    def _try_video_audio(
+        self,
+        source: Path,
+        destination: Path,
+        *,
+        input_format: str,
+        deadline: float,
+    ) -> bool:
         try:
             self._run_ffmpeg(
                 [
@@ -427,6 +509,8 @@ class MediaProcessor:
                 ],
                 destination,
                 error_kind="audio_unavailable",
+                input_format=input_format,
+                deadline=deadline,
             )
         except MediaProcessingError as error:
             if error.kind == "audio_unavailable":
@@ -440,8 +524,17 @@ class MediaProcessor:
         destination: Path,
         *,
         error_kind: str,
+        input_format: str,
+        deadline: float | None = None,
     ) -> None:
         if not self.dependency_ready():
+            raise MediaProcessingError("ffmpeg_unavailable")
+        remaining = (
+            self.timeout_seconds
+            if deadline is None
+            else deadline - time.monotonic()
+        )
+        if remaining <= 0:
             raise MediaProcessingError("ffmpeg_unavailable")
         temporary = destination.with_name(
             f".{destination.stem}.part-{os.getpid()}{destination.suffix}"
@@ -457,12 +550,14 @@ class MediaProcessor:
                     "error",
                     "-nostdin",
                     "-y",
+                    *_ffmpeg_input_options(input_format),
                     *arguments,
                     str(temporary),
                 ],
                 check=False,
-                capture_output=True,
-                timeout=self.timeout_seconds,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=remaining,
             )
         except (OSError, subprocess.TimeoutExpired):
             raise MediaProcessingError("ffmpeg_unavailable") from None

@@ -97,3 +97,38 @@ advisory lock serializes publication and retention across processes; the next
 run safely removes strictly named owner-owned temporary files left by an
 interrupted attempt. Remote outages are operational states, not local restart
 signals.
+
+## Optional media acceleration
+
+Voice and video preparation may use a mutually authenticated HTTPS worker on a
+trusted LAN. The bridge uploads only the source bytes plus a bounded media kind
+and duration. The worker returns at most one audio artifact and three ordered
+JPEG frames. The bridge verifies sizes and hashes, atomically publishes the
+artifacts inside its own owner-only media directory, and gives Codex only those
+local paths.
+
+This worker does not own durable bridge state. A bounded queue and short result
+cache make duplicate job submission idempotent, while the source file on the
+bridge remains authoritative. The spool has a lifetime single-owner lock,
+durable retryable jobs, atomic results, quota reservations, startup recovery,
+and periodic TTL cleanup. Server and client use aggregate wall deadlines;
+FFmpeg and the boot service have aligned file-size and process resource
+limits.
+
+Input pixels, single allocations, codec/filter threads, and output size are
+bounded before and during FFmpeg work. Native macOS additionally polls public
+libproc physical-footprint data for the FFmpeg process group and kills it above
+512 MiB. This is best-effort because macOS resident-set limits are advisory;
+Linux systemd `MemoryMax` is the strict cgroup boundary. A hard cap on Apple
+hardware requires a capped Linux VM.
+
+Infrastructure, transport, TLS, capacity, timeout, protocol, malformed-output,
+and unsupported-capability failures use the local `MediaProcessor`. A terminal
+invalid-media conclusion from the authenticated worker is intentionally
+returned without a second local attempt. The worker is not a critical bridge
+loop, readiness condition, watchdog input, or systemd dependency.
+
+The worker TLS identity and operating-system account are deliberately unrelated
+to any separate full-access main-user Codex SSH channel. Its private CA stays
+offline between leaf issuance events, and certificate renewal is planned in
+advance rather than weakening mTLS at expiry.

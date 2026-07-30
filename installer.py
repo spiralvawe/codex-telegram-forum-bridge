@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import getpass
+import importlib.resources
 import json
 import os
 import plistlib
@@ -12,12 +14,15 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import venv
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 from codex_telegram_bridge.config import (
     BridgeConfig,
+    MediaWorkerClientConfig,
     default_instance_id,
     read_bot_token,
 )
@@ -25,6 +30,30 @@ from codex_telegram_bridge.config import (
 
 ROOT = Path(__file__).resolve().parent
 SERVICE_PREFIX = "dev.codex.telegram-bridge"
+BOOTSTRAP_PYPROJECT = """\
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "codex-telegram-forum-bridge"
+version = "{version}"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+codex-telegram-bridge = "codex_telegram_bridge.cli:main"
+codex-telegram-bridge-installer = "installer:main"
+codex-telegram-media-worker = "codex_telegram_bridge.media_worker_cli:main"
+
+[tool.setuptools]
+packages = ["codex_telegram_bridge"]
+py-modules = ["installer"]
+include-package-data = true
+
+[tool.setuptools.package-data]
+codex_telegram_bridge = ["assets/*.png", "requirements.lock"]
+"""
 
 
 class InstallerError(RuntimeError):
@@ -113,35 +142,84 @@ def config_path(config: BridgeConfig) -> Path:
     return config.state_dir / "config.json"
 
 
+@contextlib.contextmanager
+def runtime_bootstrap_inputs() -> Any:
+    """Yield a lock file and installable source from source or an installed wheel."""
+    source_lock = ROOT / "requirements.lock"
+    if (
+        (ROOT / "pyproject.toml").is_file()
+        and source_lock.is_file()
+        and (ROOT / "codex_telegram_bridge" / "__init__.py").is_file()
+    ):
+        yield source_lock, ROOT
+        return
+
+    import codex_telegram_bridge
+
+    package_root = Path(codex_telegram_bridge.__file__).resolve().parent
+    try:
+        lock_payload = (
+            importlib.resources.files("codex_telegram_bridge")
+            .joinpath("requirements.lock")
+            .read_bytes()
+        )
+    except (FileNotFoundError, ModuleNotFoundError):
+        raise InstallerError(
+            "Installed package is missing its bootstrap dependency lock"
+        ) from None
+    with tempfile.TemporaryDirectory(
+        prefix="codex-telegram-bootstrap-"
+    ) as temporary:
+        staging = Path(temporary)
+        staged_package = staging / "codex_telegram_bridge"
+        shutil.copytree(
+            package_root,
+            staged_package,
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+        )
+        shutil.copy2(Path(__file__).resolve(), staging / "installer.py")
+        version = str(getattr(codex_telegram_bridge, "__version__", ""))
+        if not re.fullmatch(r"[0-9]+(?:\.[0-9]+){2}", version):
+            raise InstallerError("Installed package version is invalid")
+        (staging / "pyproject.toml").write_text(
+            BOOTSTRAP_PYPROJECT.format(version=version),
+            encoding="utf-8",
+        )
+        staged_lock = staging / "requirements.lock"
+        staged_lock.write_bytes(lock_payload)
+        yield staged_lock, staging
+
+
 def prepare_runtime(config: BridgeConfig) -> None:
     ensure_private_directory(config.state_dir)
     environment = config.state_dir / "runtime"
     if not (environment / "bin" / "python").is_file():
         venv.EnvBuilder(with_pip=True).create(environment)
     python = str(runtime_python(config))
-    run(
-        [
-            python,
-            "-m",
-            "pip",
-            "install",
-            "--disable-pip-version-check",
-            "--require-hashes",
-            "-r",
-            str(ROOT / "requirements.lock"),
-        ]
-    )
-    run(
-        [
-            python,
-            "-m",
-            "pip",
-            "install",
-            "--disable-pip-version-check",
-            "--no-deps",
-            str(ROOT),
-        ]
-    )
+    with runtime_bootstrap_inputs() as (lock_path, install_source):
+        run(
+            [
+                python,
+                "-m",
+                "pip",
+                "install",
+                "--disable-pip-version-check",
+                "--require-hashes",
+                "-r",
+                str(lock_path),
+            ]
+        )
+        run(
+            [
+                python,
+                "-m",
+                "pip",
+                "install",
+                "--disable-pip-version-check",
+                "--no-deps",
+                str(install_source),
+            ]
+        )
 
 
 def bootstrap_codex_daemon(config: BridgeConfig) -> None:
@@ -182,26 +260,117 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
     if not workspace.is_dir():
         raise InstallerError(f"Workspace does not exist: {workspace}")
     instance = args.instance or default_instance_id(workspace)
-    config = BridgeConfig.from_paths(
+    media_worker = (
+        MediaWorkerClientConfig.from_file(args.media_worker_client_config)
+        if args.media_worker_client_config
+        else None
+    )
+    locator = BridgeConfig.from_paths(
         workspace=workspace,
         state_dir=args.state_dir,
         instance_id=instance,
-        secret_backend=args.secret_backend,
-        secret_reference=args.secret_reference,
-        secret_vault=args.secret_vault,
-        max_active_turns=args.max_active_turns,
-        codex_full_access=args.codex_full_access,
+        codex_full_access=False,
     )
-    if args.codex_binary:
-        payload = config.as_file_payload()
-        payload["codex_binary"] = str(
-            Path(args.codex_binary).expanduser().resolve()
+    existing_config_path = config_path(locator)
+    existing = (
+        BridgeConfig.from_file(existing_config_path)
+        if existing_config_path.exists()
+        else None
+    )
+    if existing is not None:
+        if (
+            existing.instance_id != instance
+            or existing.workspace != workspace
+            or existing.state_dir != locator.state_dir
+        ):
+            raise InstallerError(
+                "Existing instance belongs to a different workspace; choose "
+                "a new --instance or --state-dir"
+            )
+        updates: dict[str, Any] = {}
+        if args.secret_backend is not None:
+            selected_backend = str(args.secret_backend)
+            if selected_backend != existing.secret_backend:
+                requested_secret = BridgeConfig.from_paths(
+                    workspace=workspace,
+                    state_dir=existing.state_dir,
+                    instance_id=existing.instance_id,
+                    secret_backend=selected_backend,
+                    secret_reference=args.secret_reference,
+                    secret_vault=(
+                        None
+                        if args.clear_secret_vault
+                        else args.secret_vault
+                    ),
+                    codex_full_access=False,
+                )
+                updates.update(
+                    secret_backend=requested_secret.secret_backend,
+                    secret_reference=requested_secret.secret_reference,
+                    secret_vault=requested_secret.secret_vault,
+                    keychain_service=requested_secret.keychain_service,
+                )
+        if (
+            args.secret_reference is not None
+            and "secret_reference" not in updates
+        ):
+            updates["secret_reference"] = str(args.secret_reference)
+            updates["keychain_service"] = (
+                str(args.secret_reference)
+                if (
+                    updates.get(
+                        "secret_backend",
+                        existing.secret_backend,
+                    )
+                    == "macos-keychain"
+                )
+                else None
+            )
+        if args.clear_secret_vault:
+            updates["secret_vault"] = None
+        elif args.secret_vault is not None and "secret_vault" not in updates:
+            updates["secret_vault"] = str(args.secret_vault)
+        if args.max_active_turns is not None:
+            updates["max_active_turns"] = args.max_active_turns
+        if args.codex_full_access is not None:
+            updates["codex_full_access"] = args.codex_full_access
+        if args.codex_binary:
+            updates["codex_binary"] = str(
+                Path(args.codex_binary).expanduser().resolve()
+            )
+        if args.media_worker_client_config is not None:
+            updates["media_worker"] = media_worker
+        elif args.disable_media_worker:
+            updates["media_worker"] = None
+        config = replace(existing, **updates)
+        if config.database_path.exists() and (
+            existing.secret_backend != config.secret_backend
+            or existing.secret_reference != config.secret_reference
+        ):
+            raise InstallerError(
+                "Refusing to replace the secret binding of a live instance"
+            )
+    else:
+        config = BridgeConfig.from_paths(
+            workspace=workspace,
+            state_dir=locator.state_dir,
+            instance_id=instance,
+            secret_backend=args.secret_backend,
+            secret_reference=args.secret_reference,
+            secret_vault=(
+                None if args.clear_secret_vault else args.secret_vault
+            ),
+            max_active_turns=args.max_active_turns,
+            codex_full_access=bool(args.codex_full_access),
+            media_worker=media_worker,
         )
-        temporary_path = config.state_dir / ".prepare-config.json"
-        ensure_private_directory(config.state_dir)
-        atomic_json(temporary_path, payload)
-        config = BridgeConfig.from_file(temporary_path)
-        temporary_path.unlink()
+        if args.codex_binary:
+            config = replace(
+                config,
+                codex_binary=str(
+                    Path(args.codex_binary).expanduser().resolve()
+                ),
+            )
     if not shutil.which(config.codex_binary) and not Path(
         config.codex_binary
     ).is_file():
@@ -212,25 +381,6 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
         config.ffmpeg_binary
     ).is_file():
         raise InstallerError("ffmpeg is required for voice/video messages")
-
-    existing_config_path = config_path(config)
-    if existing_config_path.exists():
-        existing = BridgeConfig.from_file(existing_config_path)
-        if (
-            existing.instance_id != config.instance_id
-            or existing.workspace != config.workspace
-        ):
-            raise InstallerError(
-                "Existing instance belongs to a different workspace; choose "
-                "a new --instance or --state-dir"
-            )
-        if config.database_path.exists() and (
-            existing.secret_backend != config.secret_backend
-            or existing.secret_reference != config.secret_reference
-        ):
-            raise InstallerError(
-                "Refusing to replace the secret binding of a live instance"
-            )
 
     prepare_runtime(config)
     if not args.skip_app_server_bootstrap:
@@ -478,6 +628,10 @@ def install_systemd(config: BridgeConfig) -> list[str]:
     run(["systemctl", "--user", "enable", "--now", unit_name])
     run(["systemctl", "--user", "enable", "--now", timer_name])
     run(["systemctl", "--user", "enable", "--now", backup_timer_name])
+    # `enable --now` does not restart an already-active bridge. Activation is
+    # also the configuration reload boundary, so force and verify that reload.
+    run(["systemctl", "--user", "restart", unit_name])
+    run(["systemctl", "--user", "is-active", "--quiet", unit_name])
     return [unit_name, timer_name, backup_timer_name]
 
 
@@ -749,8 +903,31 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("macos-keychain", "proton-pass", "file"),
     )
     prepare_parser.add_argument("--secret-reference")
-    prepare_parser.add_argument("--secret-vault")
+    secret_vault_group = prepare_parser.add_mutually_exclusive_group()
+    secret_vault_group.add_argument("--secret-vault")
+    secret_vault_group.add_argument(
+        "--clear-secret-vault",
+        action="store_true",
+        help="Clear the optional Proton Pass vault selection.",
+    )
     prepare_parser.add_argument("--codex-binary")
+    media_worker_group = prepare_parser.add_mutually_exclusive_group()
+    media_worker_group.add_argument(
+        "--media-worker-client-config",
+        help=(
+            "Owner-only JSON connection file for an optional least-privilege "
+            "media worker. It must not contain Telegram, Codex, Proton Pass, "
+            "SSH, or sudo credentials."
+        ),
+    )
+    media_worker_group.add_argument(
+        "--disable-media-worker",
+        action="store_true",
+        help=(
+            "Remove the optional media worker from an existing instance and "
+            "return to local-only FFmpeg processing."
+        ),
+    )
     prepare_parser.add_argument(
         "--max-active-turns",
         type=int,
@@ -762,10 +939,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     prepare_parser.add_argument(
         "--codex-full-access",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=None,
         help=(
             "Run Telegram-started Codex turns with approval policy 'never' "
-            "and the danger-full-access sandbox."
+            "and the danger-full-access sandbox. Existing instances preserve "
+            "their setting unless this or --no-codex-full-access is given."
         ),
     )
     prepare_parser.add_argument(

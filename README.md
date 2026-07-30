@@ -222,6 +222,135 @@ second trusted device using authenticated transport and encryption at rest.
 Never expose the live database or its backups publicly: both contain private
 conversation and identifier data.
 
+## Optional media worker
+
+A low-power bridge host can optionally ask one trusted LAN worker to prepare
+Telegram voice and video with FFmpeg. The worker is only an accelerator:
+
+- the bridge host remains the sole owner of Telegram polling, SQLite, Codex,
+  queue state, and every final `LocalInput`;
+- documents, prompts, workspace paths, Telegram identifiers, bot tokens,
+  Codex credentials, and password-manager data are never sent to the worker;
+- mutual TLS authenticates both hosts and encrypts the media in transit;
+- strict byte, artifact, queue, concurrency, and time limits bound every job;
+- infrastructure, transport, TLS, capacity, timeout, protocol, malformed
+  response, and unsupported-capability failures fall back to local FFmpeg;
+- an authenticated terminal invalid-media result is returned directly and is
+  intentionally not processed a second time on the resource-limited host.
+
+The optional worker is never a systemd dependency and is not part of bridge
+readiness or the local watchdog. Removing its configuration restores the exact
+local-only behavior.
+
+The worker identity must stay separate from any SSH channel that gives the
+main macOS user or Codex full access. Do not reuse that user's account, SSH
+keys, authorized-key rules, sudo authority, home directory, Codex login, or
+password-manager session for the media worker.
+
+The repository only renders reviewed boot-service definitions; it does not
+install them. See [docs/MEDIA_WORKER.md](docs/MEDIA_WORKER.md) for the bounded
+configuration contract, dedicated-account requirement, and rollback path.
+
+Minimal deployment flow:
+
+1. Approve a dedicated non-login account, a stable mDNS/DNS name and port, and
+   a private one-purpose CA. Issue a server certificate whose SAN is the
+   Pi-side `server_name`, plus a client certificate used only by this bridge.
+   Keep the CA private key off both runtime hosts after issuance.
+2. Install Python, this package, and FFmpeg in a root-owned location that the
+   worker can execute but cannot modify. Put worker state, its `0600` config,
+   and its server key in separate worker-owned paths. Copy only the client
+   certificate/key and server CA to an owner-only Pi path.
+3. Create the two closed-schema JSON files shown in
+   [docs/MEDIA_WORKER.md](docs/MEDIA_WORKER.md), then validate and render:
+
+```sh
+sudo -u SERVICE_USER codex-telegram-media-worker \
+  --config /absolute/path/to/worker.json probe-config
+
+sudo -u SERVICE_USER codex-telegram-media-worker \
+  --config /absolute/path/to/worker.json render-launchd \
+  --service-user SERVICE_USER \
+  --python-executable /root-owned/runtime/bin/python
+```
+
+Use `render-systemd` instead of `render-launchd` on Linux. Review the rendered
+boot-service definition before installing it. macOS stdout/stderr are sent to
+`/dev/null`; the worker writes a sanitized owner-only log under
+`state_dir/logs`, rotated at 1 MiB with three backups. Linux also retains
+bounded policy-controlled journal records.
+
+FFmpeg is limited to one decoder, encoder, and filter thread, 16,777,216 input
+pixels, 128 MiB per allocation, and bounded output. Native macOS also polls
+the FFmpeg process group's physical footprint and kills it above 512 MiB.
+That watchdog is best-effort: launchd's resident-set setting is advisory, not
+a hard memory boundary. Linux `MemoryMax` is strict; a strict cap on Apple
+hardware requires a capped Linux VM. Keep native-Mac worker concurrency at
+one and expose it only to the private trusted bridge identity.
+
+Rendering fails unless `SERVICE_USER` already exists, has a non-login shell,
+has nonzero UID, and has no administrative, remote-access, custom, or
+root-equivalent group membership. Linux requires primary-group-only
+membership. macOS permits only the reviewed automatic `everyone`,
+`localaccounts`, `_lpoperator`, and `com.apple.sharepoint.group.N` groups in
+addition to the primary group.
+
+After review, the macOS boot-level install is:
+
+```sh
+sudo install -o root -g wheel -m 0644 REVIEWED.plist \
+  /Library/LaunchDaemons/com.codex.telegram-media-worker.plist
+sudo launchctl bootstrap system \
+  /Library/LaunchDaemons/com.codex.telegram-media-worker.plist
+```
+
+The corresponding Linux `systemctl enable --now` flow is documented in
+[docs/MEDIA_WORKER.md](docs/MEDIA_WORKER.md).
+
+On a multi-interface worker, an explicit `0.0.0.0` or `::` listener survives
+interface and DHCP failover. It also listens on every matching interface, so
+mutual TLS and a host/network firewall limited to trusted LAN clients are
+mandatory. The Pi may connect by the stable certificate name rather than a
+pinned lease.
+
+After the worker is healthy, enable the client on the Pi:
+
+```sh
+codex-telegram-bridge-installer prepare \
+  --workspace /absolute/path/to/the/project \
+  --instance EXISTING_INSTANCE \
+  --state-dir /absolute/path/to/existing/state \
+  --media-worker-client-config /absolute/path/to/client.json
+
+codex-telegram-bridge-installer activate \
+  --config /absolute/path/to/existing/state/config.json
+```
+
+Stop the worker once and confirm the same harmless media request completes
+through local FFmpeg before considering the deployment complete. Preserve the
+exact existing `--instance` and `--state-dir`: `prepare` alone does not reload
+the running service, and its returned `activate` command is mandatory.
+
+Local-only rollback does not touch the worker host. It also requires prepare
+and activate:
+
+```sh
+codex-telegram-bridge-installer prepare \
+  --workspace /absolute/path/to/the/project \
+  --instance EXISTING_INSTANCE \
+  --state-dir /absolute/path/to/existing/state \
+  --disable-media-worker
+
+codex-telegram-bridge-installer activate \
+  --config /absolute/path/to/existing/state/config.json
+```
+
+The installed console installer works outside a repository checkout; when
+working from a clone, `python3 installer.py` is an equivalent entry point.
+Track both leaf-certificate expiries, begin renewal checks 90 days before
+expiry, complete replacement by 60 days before expiry, and keep the CA private
+key offline between issuance events.
+
 ## Development
 
 ```sh

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "codex-telegram-forum-bridge"
-version = "0.3.0"
+version = "0.4.0"
 description = "Mirror one local Codex workspace into Topics in a private Telegram forum supergroup."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -27,6 +27,7 @@ classifiers = [
 [project.scripts]
 codex-telegram-bridge = "codex_telegram_bridge.cli:main"
 codex-telegram-bridge-installer = "installer:main"
+codex-telegram-media-worker = "codex_telegram_bridge.media_worker_cli:main"
 
 [tool.setuptools]
 packages = ["codex_telegram_bridge"]
@@ -34,4 +35,4 @@ py-modules = ["installer"]
 include-package-data = true
 
 [tool.setuptools.package-data]
-codex_telegram_bridge = ["assets/*.png"]
+codex_telegram_bridge = ["assets/*.png", "requirements.lock"]

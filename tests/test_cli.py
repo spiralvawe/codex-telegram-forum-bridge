@@ -70,7 +70,27 @@ class DoctorDesktopDetectionTests(unittest.TestCase):
                 }
             )
         )
-        self.assertFalse(requirements_allow_full_access("invalid"))  # type: ignore[arg-type]
+        self.assertFalse(
+            requirements_allow_full_access(
+                {
+                    "allowedApprovalPolicies": ["never"],
+                    "allowedPermissionProfiles": {":workspace": True},
+                }
+            )
+        )
+        self.assertFalse(
+            requirements_allow_full_access(
+                {
+                    "allowedApprovalPolicies": ["never"],
+                    "defaultPermissions": ":workspace",
+                }
+            )
+        )
+        self.assertFalse(
+            requirements_allow_full_access(  # type: ignore[arg-type]
+                "invalid"
+            )
+        )
 
     def test_running_desktop_must_have_positive_socket_peer(self) -> None:
         running, shared = detect_desktop_shared_socket(

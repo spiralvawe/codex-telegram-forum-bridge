@@ -44,6 +44,12 @@ def requirements_allow_full_access(
         return False
     approval_policies = requirements.get("allowedApprovalPolicies")
     sandbox_modes = requirements.get("allowedSandboxModes")
+    permission_profiles = requirements.get("allowedPermissionProfiles")
+    default_permissions = requirements.get("defaultPermissions")
+    legacy_sandbox_allowed = (
+        permission_profiles is None
+        and default_permissions is None
+    )
     approval_allowed = (
         approval_policies is None
         or (
@@ -58,7 +64,7 @@ def requirements_allow_full_access(
             and "danger-full-access" in sandbox_modes
         )
     )
-    return approval_allowed and sandbox_allowed
+    return legacy_sandbox_allowed and approval_allowed and sandbox_allowed
 
 
 def detect_desktop_shared_socket(

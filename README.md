@@ -90,7 +90,8 @@ across all Telegram Topics:
 python3 installer.py prepare \
   --workspace "/srv/projects/example" \
   --secret-backend file \
-  --max-active-turns 1
+  --max-active-turns 1 \
+  --codex-full-access
 ```
 
 `max_active_turns=0` is the default and preserves unlimited cross-Topic
@@ -101,6 +102,13 @@ can be supplied as `CODEX_TELEGRAM_MAX_ACTIVE_TURNS` before `prepare`, or as
 `max_active_turns` in the owner-only JSON configuration. A start/steer request
 whose result is unknown continues to occupy capacity across reconnects until
 Codex history safely reconciles it.
+
+`--codex-full-access` is an explicit trust decision. It makes every new,
+resumed, and Telegram-started Codex turn use `approval_policy=never` and the
+`danger-full-access` sandbox, even if the host Codex defaults are more
+restrictive. Use it only for a private group whose bound administrator is
+trusted to act with the same filesystem and network access as the service OS
+user. Omitting it preserves the host Codex permission defaults.
 
 The command prints the owner-only configuration path and the exact next
 commands. Then:

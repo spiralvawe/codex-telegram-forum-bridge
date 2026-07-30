@@ -42,6 +42,14 @@ Secret questions are not rendered in Telegram. Operators should still reserve
 high-risk credentials and unfamiliar system changes for a trusted local
 surface.
 
+An instance prepared with `--codex-full-access` deliberately bypasses these
+approval prompts. The bridge sends `approval_policy=never` and
+`danger-full-access` explicitly when it starts or resumes a thread and when it
+starts every turn. Only enable this for a private group whose bound
+administrator may act with all filesystem and network privileges of the
+bridge's OS account. Operating-system permissions still apply; this flag does
+not grant root access.
+
 ## Reporting
 
 Do not include tokens, private identifiers, message/database dumps, or user

@@ -71,8 +71,17 @@ Run:
 ```sh
 python3 installer.py prepare \
   --workspace "/absolute/path/to/target-project" \
-  --secret-backend BACKEND
+  --secret-backend BACKEND \
+  --codex-full-access
 ```
+
+This installation contract assumes the owner wants Telegram to be a fully
+trusted Codex control surface. `--codex-full-access` explicitly selects
+`approval_policy=never` and `danger-full-access` for every new, resumed, and
+Telegram-started turn. Before running it, state that Telegram commands will
+have the same filesystem and network access as the bridge's OS user. If the
+owner does not accept that boundary, omit the flag and explain that Codex may
+request local or Telegram approvals.
 
 For a host with limited memory, add `--max-active-turns 1`. This is a global
 limit across every Telegram Topic in the instance, not a per-Topic limit.
@@ -176,6 +185,9 @@ Use a disposable Codex task/Topic. Verify:
 - restart of the bridge service preserves the queue and mappings.
 - when `max_active_turns` is positive, a task in another Topic remains queued
   until the current turn actually terminates.
+- when `--codex-full-access` is enabled, harmless workspace, outside-workspace,
+  and outbound-network probes complete without an approval request, while an
+  OS-level path forbidden to the service user remains forbidden.
 
 Do not use a physical actuator, production deployment, payment, credential
 change, or other high-impact action as a smoke test.

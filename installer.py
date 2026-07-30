@@ -190,6 +190,7 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
         secret_reference=args.secret_reference,
         secret_vault=args.secret_vault,
         max_active_turns=args.max_active_turns,
+        codex_full_access=args.codex_full_access,
     )
     if args.codex_binary:
         payload = config.as_file_payload()
@@ -659,6 +660,14 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Maximum simultaneous Codex turns; 0 keeps the default "
             "unlimited behavior."
+        ),
+    )
+    prepare_parser.add_argument(
+        "--codex-full-access",
+        action="store_true",
+        help=(
+            "Run Telegram-started Codex turns with approval policy 'never' "
+            "and the danger-full-access sandbox."
         ),
     )
     prepare_parser.add_argument(

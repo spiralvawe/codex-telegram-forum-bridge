@@ -18,6 +18,7 @@ from typing import Any
 from .codex import (
     CodexAppServer,
     CodexProtocolCompatibilityError,
+    codex_daemon_environment,
 )
 from .config import BridgeConfig, read_bot_token
 from .service import BridgeService, bootstrap_group
@@ -32,6 +33,38 @@ from .telegram import TelegramAPI, TelegramError
 LOGGER = logging.getLogger(__name__)
 MAX_HEALTHY_QUEUE_AGE_SECONDS = 6 * 60 * 60
 MAX_HEALTHY_DISPATCH_AGE_SECONDS = 5 * 60
+
+
+def requirements_allow_full_access(
+    requirements: dict[str, Any] | None,
+) -> bool:
+    if requirements is None:
+        return True
+    if not isinstance(requirements, dict):
+        return False
+    approval_policies = requirements.get("allowedApprovalPolicies")
+    sandbox_modes = requirements.get("allowedSandboxModes")
+    permission_profiles = requirements.get("allowedPermissionProfiles")
+    default_permissions = requirements.get("defaultPermissions")
+    legacy_sandbox_allowed = (
+        permission_profiles is None
+        and default_permissions is None
+    )
+    approval_allowed = (
+        approval_policies is None
+        or (
+            isinstance(approval_policies, list)
+            and "never" in approval_policies
+        )
+    )
+    sandbox_allowed = (
+        sandbox_modes is None
+        or (
+            isinstance(sandbox_modes, list)
+            and "danger-full-access" in sandbox_modes
+        )
+    )
+    return legacy_sandbox_allowed and approval_allowed and sandbox_allowed
 
 
 def detect_desktop_shared_socket(
@@ -387,6 +420,7 @@ async def run_doctor(
             capture_output=True,
             text=True,
             timeout=10,
+            env=codex_daemon_environment(config.codex_app_server_socket),
         )
     except (OSError, subprocess.TimeoutExpired):
         version_result = subprocess.CompletedProcess([], 1, "", "")
@@ -444,6 +478,9 @@ async def run_doctor(
         "workspaceExists": config.workspace.is_dir(),
         "stateDirectory": str(config.state_dir),
         "secretBackend": config.secret_backend,
+        "codexFullAccess": config.codex_full_access,
+        "codexFullAccessAllowed": None,
+        "codexPermissionDefaultsMatch": None,
         "botUsername": identity.username,
         "telegramBound": binding is not None,
         "codexAppServer": False,
@@ -496,16 +533,45 @@ async def run_doctor(
         on_server_request=ignore,
         socket_path=config.codex_app_server_socket,
         compatible_versions=config.compatible_codex_versions,
+        full_access=config.codex_full_access,
     )
     try:
         try:
             await app_server.start()
+            native_config_result = await app_server.request("config/read", {})
+            requirements_result = await app_server.request(
+                "configRequirements/read",
+                {},
+            )
+            native_config = native_config_result.get("config")
+            requirements_present = "requirements" in requirements_result
+            requirements = requirements_result.get("requirements")
+            config_contract_valid = (
+                isinstance(native_config, dict)
+                and requirements_present
+                and (
+                    requirements is None
+                    or isinstance(requirements, dict)
+                )
+            )
+            full_access_allowed = (
+                requirements_allow_full_access(requirements)
+                if config_contract_valid
+                else False
+            )
+            result["codexFullAccessAllowed"] = full_access_allowed
+            result["codexPermissionDefaultsMatch"] = bool(
+                isinstance(native_config, dict)
+                and native_config.get("approval_policy") == "never"
+                and native_config.get("sandbox_mode")
+                == "danger-full-access"
+            )
             threads = await app_server.list_threads(archived=False)
             archived_threads = await app_server.list_threads(archived=True)
             contract_valid = all(
                 str(thread.get("id") or "")
                 for thread in (*threads, *archived_threads)
-            )
+            ) and config_contract_valid
             if threads:
                 sample = await app_server.read_thread(str(threads[0]["id"]))
                 contract_valid = (
@@ -535,6 +601,10 @@ async def run_doctor(
         and result["unresolvedTopicCreations"] == 0
         and result["pendingArchiveDeletions"] == 0
         and result.get("codexProtocolSmoke") is True
+        and (
+            not config.codex_full_access
+            or result.get("codexFullAccessAllowed") is True
+        )
         and bool((result.get("mapping") or {}).get("exact"))
         and desktop_uses_shared is not False
         and binding is not None

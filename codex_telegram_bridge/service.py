@@ -1355,6 +1355,7 @@ class BridgeService:
             on_server_request=self.on_codex_server_request,
             socket_path=config.codex_app_server_socket,
             compatible_versions=config.compatible_codex_versions,
+            full_access=config.codex_full_access,
         )
         self.media = MediaProcessor(
             root=config.media_directory,

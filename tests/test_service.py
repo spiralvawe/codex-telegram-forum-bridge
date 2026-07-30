@@ -344,6 +344,21 @@ class ServiceRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.store.close()
         self.temp_dir.cleanup()
 
+    def test_bridge_service_wires_explicit_full_access(self) -> None:
+        config = BridgeConfig(
+            workspace=self.service.config.workspace,
+            state_dir=self.service.config.state_dir,
+            codex_full_access=True,
+        )
+
+        service = BridgeService(
+            config=config,
+            store=self.store,
+            telegram=self.telegram,
+        )
+
+        self.assertTrue(service.codex.full_access)
+
     def test_person_review_text_parser_is_explicit(self) -> None:
         self.assertEqual(parse_person_review_text("подходит"), "yes")
         self.assertEqual(parse_person_review_text("Да, подходит!"), "yes")

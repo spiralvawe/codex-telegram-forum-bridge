@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
 import socket
 import subprocess
 from collections.abc import Awaitable, Callable
@@ -36,6 +37,18 @@ class CodexProtocolCompatibilityError(CodexProtocolError):
     pass
 
 
+def codex_daemon_environment(
+    socket_path: str | Path | None,
+) -> dict[str, str]:
+    environment = dict(os.environ)
+    if socket_path is None:
+        return environment
+    resolved = Path(socket_path).expanduser()
+    if resolved.parent.name == "app-server-control":
+        environment["CODEX_HOME"] = str(resolved.parent.parent)
+    return environment
+
+
 class CodexAppServer:
     def __init__(
         self,
@@ -46,6 +59,7 @@ class CodexAppServer:
         on_server_request: ServerRequestHandler,
         socket_path: str | Path | None = None,
         compatible_versions: tuple[str, ...] = (),
+        full_access: bool = False,
     ):
         self.codex_binary = codex_binary
         self.cwd = cwd
@@ -53,6 +67,7 @@ class CodexAppServer:
         self.on_server_request = on_server_request
         self.socket_path = Path(socket_path).expanduser() if socket_path else None
         self.compatible_versions = frozenset(compatible_versions)
+        self.full_access = full_access
         self.process: asyncio.subprocess.Process | None = None
         self._websocket: websocket.WebSocket | None = None
         self._reader_task: asyncio.Task[None] | None = None
@@ -151,6 +166,7 @@ class CodexAppServer:
                 capture_output=True,
                 text=True,
                 timeout=10,
+                env=codex_daemon_environment(self.socket_path),
             )
         except (OSError, subprocess.TimeoutExpired):
             return None
@@ -582,6 +598,22 @@ class CodexAppServer:
     def cached_thread_settings(self, thread_id: str) -> dict[str, Any]:
         return dict(self._thread_settings.get(thread_id) or {})
 
+    def _thread_permission_params(self) -> dict[str, Any]:
+        if not self.full_access:
+            return {}
+        return {
+            "approvalPolicy": "never",
+            "sandbox": "danger-full-access",
+        }
+
+    def _turn_permission_params(self) -> dict[str, Any]:
+        if not self.full_access:
+            return {}
+        return {
+            "approvalPolicy": "never",
+            "sandboxPolicy": {"type": "dangerFullAccess"},
+        }
+
     async def resume_thread(
         self,
         thread_id: str,
@@ -591,7 +623,13 @@ class CodexAppServer:
         if thread_id in self._loaded_threads:
             if not refresh_settings:
                 return self.cached_thread_settings(thread_id)
-        result = await self.request("thread/resume", {"threadId": thread_id})
+        result = await self.request(
+            "thread/resume",
+            {
+                "threadId": thread_id,
+                **self._thread_permission_params(),
+            },
+        )
         self._loaded_threads.add(thread_id)
         return self.remember_thread_settings(thread_id, result)
 
@@ -647,6 +685,7 @@ class CodexAppServer:
                 "cwd": self.cwd,
                 "ephemeral": False,
                 "threadSource": "telegram_bridge",
+                **self._thread_permission_params(),
             },
         )
         thread = dict(result["thread"])
@@ -719,6 +758,7 @@ class CodexAppServer:
                 "threadId": thread_id,
                 "input": self._turn_input(text, local_inputs),
                 "clientUserMessageId": client_id,
+                **self._turn_permission_params(),
             },
         )
         return dict(result["turn"])

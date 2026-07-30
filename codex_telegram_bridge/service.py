@@ -34,6 +34,7 @@ from .media import (
     document_request_text,
     media_request_text,
 )
+from .media_pipeline import HybridMediaProcessor, build_media_worker_client
 from .outbound_media import (
     OutboundAttachment,
     OutboundMediaError,
@@ -1364,6 +1365,20 @@ class BridgeService:
             retention_seconds=config.media_retention_days * 24 * 60 * 60,
             storage_limit_bytes=config.media_storage_limit_bytes,
         )
+        try:
+            media_worker = build_media_worker_client(config.media_worker)
+        except Exception as error:
+            LOGGER.warning(
+                "Optional media worker configuration is unavailable; "
+                "reason=%s; using local ffmpeg",
+                type(error).__name__,
+            )
+            media_worker = None
+        # Keep only the remote client's circuit state here.  The hybrid
+        # adapter itself is intentionally rebuilt for each inbound item so
+        # tests and embedders that replace ``self.media`` retain the existing
+        # dependency-injection behavior.
+        self.media_worker = media_worker
         self.outbound_media = OutboundMediaResolver(
             root=config.media_directory,
             max_bytes=MAX_TELEGRAM_DOCUMENT_BYTES,
@@ -1992,6 +2007,10 @@ class BridgeService:
             self.media.prune,
             protected_paths=protected,
         )
+        media_pipeline = HybridMediaProcessor(
+            local=self.media,
+            worker=self.media_worker,
+        )
         if kind == "document":
             source = await asyncio.to_thread(
                 self.media.document_path,
@@ -2039,21 +2058,21 @@ class BridgeService:
             prepared_inputs = (prepared_document.input,)
         elif kind == "voice":
             prepared: PreparedMedia = await asyncio.to_thread(
-                self.media.prepare_voice,
+                media_pipeline.prepare_voice,
                 media_key=media_key,
                 source_path=source,
                 duration_seconds=duration,
             )
         elif kind == "video_note":
             prepared = await asyncio.to_thread(
-                self.media.prepare_video_note,
+                media_pipeline.prepare_video_note,
                 media_key=media_key,
                 source_path=source,
                 duration_seconds=duration,
             )
         else:
             prepared = await asyncio.to_thread(
-                self.media.prepare_video,
+                media_pipeline.prepare_video,
                 media_key=media_key,
                 source_path=source,
                 duration_seconds=duration,

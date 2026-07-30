@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import os
 import plistlib
 import shutil
 import subprocess
@@ -14,7 +16,10 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import installer  # noqa: E402
-from codex_telegram_bridge.config import BridgeConfig  # noqa: E402
+from codex_telegram_bridge.config import (  # noqa: E402
+    BridgeConfig,
+    MediaWorkerClientConfig,
+)
 
 
 class PortableInstallerTests(unittest.TestCase):
@@ -42,6 +47,151 @@ class PortableInstallerTests(unittest.TestCase):
         self.assertEqual("project-one", installer.validate_instance("Project One"))
         with self.assertRaises(Exception):
             installer.validate_instance("---")
+
+    def test_wheel_installer_reconstructs_bootstrap_source(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            wheels = root / "wheels"
+            wheels.mkdir()
+            source = root / "source"
+            shutil.copytree(
+                ROOT,
+                source,
+                ignore=shutil.ignore_patterns(
+                    ".git",
+                    "build",
+                    "*.egg-info",
+                    "__pycache__",
+                    "*.pyc",
+                ),
+            )
+            subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "pip",
+                    "wheel",
+                    "--no-deps",
+                    "--wheel-dir",
+                    str(wheels),
+                    str(source),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                cwd=root,
+            )
+            wheel = next(wheels.glob("*.whl"))
+            environment = root / "installed"
+            subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "venv",
+                    str(environment),
+                ],
+                check=True,
+            )
+            python = environment / "bin" / "python"
+            environment_values = os.environ.copy()
+            environment_values.pop("PYTHONPATH", None)
+            subprocess.run(
+                [
+                    str(python),
+                    "-m",
+                    "pip",
+                    "install",
+                    "--no-deps",
+                    str(wheel),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                cwd=root,
+                env=environment_values,
+            )
+            script = r"""
+import json
+import os
+import subprocess
+import tempfile
+from pathlib import Path
+from unittest import mock
+
+import installer
+from codex_telegram_bridge.config import BridgeConfig
+
+with tempfile.TemporaryDirectory() as directory:
+    root = Path(directory)
+    workspace = root / "workspace"
+    state = root / "state"
+    workspace.mkdir()
+    runtime_python = state / "runtime" / "bin" / "python"
+    runtime_python.parent.mkdir(parents=True)
+    runtime_python.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    runtime_python.chmod(0o700)
+    config = BridgeConfig(
+        workspace=workspace,
+        state_dir=state,
+        instance_id="wheel-regression",
+        secret_backend="file",
+        secret_reference=str(state / "bot-token"),
+        codex_binary="/usr/bin/true",
+        ffmpeg_binary="/usr/bin/true",
+    )
+    observations = []
+
+    def fake_run(arguments, **kwargs):
+        del kwargs
+        if "-r" in arguments:
+            lock = Path(arguments[arguments.index("-r") + 1])
+            observations.append(("lock", lock.is_file()))
+        if "--no-deps" in arguments:
+            source = Path(arguments[-1])
+            observations.append(
+                (
+                    "source",
+                    source.is_dir(),
+                    (source / "pyproject.toml").is_file(),
+                    (source / "codex_telegram_bridge" / "__init__.py").is_file(),
+                    source != Path(installer.__file__).resolve().parent,
+                )
+            )
+        return subprocess.CompletedProcess(arguments, 0, "", "")
+
+    with mock.patch("installer.run", side_effect=fake_run):
+        installer.prepare_runtime(config)
+    print(json.dumps(observations))
+"""
+            result = subprocess.run(
+                [str(python), "-c", script],
+                cwd=root,
+                env=environment_values,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                result.returncode,
+                0,
+                msg=result.stderr,
+            )
+            observations = json.loads(result.stdout)
+        self.assertEqual(
+            observations,
+            [
+                ["lock", True],
+                ["source", True, True, True, True],
+            ],
+        )
+        self.assertEqual(
+            (ROOT / "requirements.lock").read_bytes(),
+            (
+                ROOT
+                / "codex_telegram_bridge"
+                / "requirements.lock"
+            ).read_bytes(),
+        )
 
     def test_prepare_parser_accepts_pi_safe_turn_limit(self) -> None:
         args = installer.build_parser().parse_args(
@@ -100,6 +250,168 @@ class PortableInstallerTests(unittest.TestCase):
             config = BridgeConfig.from_file(result["config"])
 
         self.assertTrue(config.codex_full_access)
+
+    def test_prepare_persists_isolated_media_worker_client_config(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "workspace"
+            state = root / "state"
+            workspace.mkdir()
+            worker_path = root / "media-worker-client.json"
+            worker = MediaWorkerClientConfig(
+                host="media-worker.local",
+                port=9443,
+                server_name="media-worker.local",
+                ca_certificate=root / "tls" / "ca.pem",
+                client_certificate=root / "tls" / "client.pem",
+                client_key=root / "tls" / "client-key.pem",
+            )
+            worker_path.write_text(
+                json.dumps(worker.as_file_payload()),
+                encoding="utf-8",
+            )
+            worker_path.chmod(0o600)
+            args = installer.build_parser().parse_args(
+                [
+                    "prepare",
+                    "--workspace",
+                    str(workspace),
+                    "--state-dir",
+                    str(state),
+                    "--secret-backend",
+                    "file",
+                    "--codex-binary",
+                    "/bin/true",
+                    "--media-worker-client-config",
+                    str(worker_path),
+                    "--skip-app-server-bootstrap",
+                ]
+            )
+            with (
+                mock.patch("installer.prepare_runtime"),
+                mock.patch(
+                    "installer.shutil.which",
+                    return_value="/bin/true",
+                ),
+            ):
+                result = installer.prepare(args)
+            config = BridgeConfig.from_file(result["config"])
+            disable_args = installer.build_parser().parse_args(
+                [
+                    "prepare",
+                    "--workspace",
+                    str(workspace),
+                    "--state-dir",
+                    str(state),
+                    "--secret-backend",
+                    "file",
+                    "--codex-binary",
+                    "/bin/true",
+                    "--disable-media-worker",
+                    "--skip-app-server-bootstrap",
+                ]
+            )
+            with (
+                mock.patch("installer.prepare_runtime"),
+                mock.patch(
+                    "installer.shutil.which",
+                    return_value="/bin/true",
+                ),
+            ):
+                disabled_result = installer.prepare(disable_args)
+            disabled = BridgeConfig.from_file(disabled_result["config"])
+
+        self.assertEqual(config.media_worker, worker)
+        self.assertIsNone(disabled.media_worker)
+        serialized = json.dumps(config.as_file_payload()).casefold()
+        self.assertNotIn("ssh", serialized)
+        self.assertNotIn("sudo", serialized)
+        self.assertNotIn("bot_token", serialized)
+
+    def test_media_worker_update_preserves_existing_runtime_policy(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "workspace"
+            state = root / "state"
+            workspace.mkdir()
+            state.mkdir(mode=0o700)
+            initial = BridgeConfig.from_paths(
+                workspace,
+                state,
+                secret_backend="file",
+                secret_reference=str(root / "custom-token"),
+                secret_vault="Custom Vault",
+                max_active_turns=1,
+                codex_full_access=True,
+            )
+            payload = initial.as_file_payload()
+            payload["codex_binary"] = "/usr/bin/true"
+            payload["ffmpeg_binary"] = "/usr/bin/true"
+            installer.atomic_json(state / "config.json", payload)
+            worker_path = root / "media-worker-client.json"
+            worker = MediaWorkerClientConfig(
+                host="media-worker.local",
+                port=9443,
+                server_name="media-worker.local",
+                ca_certificate=root / "tls" / "ca.pem",
+                client_certificate=root / "tls" / "client.pem",
+                client_key=root / "tls" / "client-key.pem",
+            )
+            worker_path.write_text(
+                json.dumps(worker.as_file_payload()),
+                encoding="utf-8",
+            )
+            worker_path.chmod(0o600)
+
+            def run_prepare(extra: list[str]) -> BridgeConfig:
+                args = installer.build_parser().parse_args(
+                    [
+                        "prepare",
+                        "--workspace",
+                        str(workspace),
+                        "--state-dir",
+                        str(state),
+                        *extra,
+                        "--skip-app-server-bootstrap",
+                    ]
+                )
+                with mock.patch("installer.prepare_runtime"):
+                    result = installer.prepare(args)
+                return BridgeConfig.from_file(result["config"])
+
+            enabled = run_prepare(
+                ["--media-worker-client-config", str(worker_path)]
+            )
+            disabled = run_prepare(["--disable-media-worker"])
+            opted_out = run_prepare(
+                [
+                    "--no-codex-full-access",
+                    "--max-active-turns",
+                    "0",
+                ]
+            )
+
+        for config in (enabled, disabled, opted_out):
+            self.assertEqual(config.secret_backend, "file")
+            self.assertEqual(
+                config.secret_reference,
+                str(root / "custom-token"),
+            )
+            self.assertEqual(config.secret_vault, "Custom Vault")
+            self.assertEqual(config.codex_binary, "/usr/bin/true")
+            self.assertEqual(config.ffmpeg_binary, "/usr/bin/true")
+        self.assertEqual(enabled.media_worker, worker)
+        self.assertTrue(enabled.codex_full_access)
+        self.assertEqual(enabled.max_active_turns, 1)
+        self.assertIsNone(disabled.media_worker)
+        self.assertTrue(disabled.codex_full_access)
+        self.assertEqual(disabled.max_active_turns, 1)
+        self.assertFalse(opted_out.codex_full_access)
+        self.assertEqual(opted_out.max_active_turns, 0)
 
     def test_systemd_working_directory_uses_directive_specific_syntax(
         self,
@@ -191,7 +503,26 @@ class PortableInstallerTests(unittest.TestCase):
             services[2],
             "codex-telegram-bridge-example-a1b2c3-backup.timer",
         )
-        self.assertGreaterEqual(invoke.call_count, 3)
+        commands = [call.args[0] for call in invoke.call_args_list]
+        self.assertIn(
+            [
+                "systemctl",
+                "--user",
+                "restart",
+                "codex-telegram-bridge-example-a1b2c3.service",
+            ],
+            commands,
+        )
+        self.assertIn(
+            [
+                "systemctl",
+                "--user",
+                "is-active",
+                "--quiet",
+                "codex-telegram-bridge-example-a1b2c3.service",
+            ],
+            commands,
+        )
 
     @unittest.skipUnless(
         sys.platform.startswith("linux") and shutil.which("systemd-analyze"),

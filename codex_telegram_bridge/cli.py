@@ -446,6 +446,8 @@ def doctor_media_health(config: BridgeConfig) -> dict[str, bool]:
         "ffmpegAvailable": ffmpeg_available,
         "mediaStorageOwnerOnly": storage_owner_only,
         "mediaInputReady": ffmpeg_available and storage_owner_only,
+        "mediaWorkerConfigured": config.media_worker is not None,
+        "mediaWorkerRequired": False,
     }
 
 

@@ -16,6 +16,7 @@ sys.path.insert(0, str(ROOT))
 
 from codex_telegram_bridge.config import (  # noqa: E402
     BridgeConfig,
+    MediaWorkerClientConfig,
     default_instance_id,
     read_file_secret,
     read_proton_pass_secret,
@@ -142,6 +143,122 @@ class PortableConfigTests(unittest.TestCase):
                 state_dir=Path.cwd(),
                 max_active_turns=True,
             )
+
+    def test_optional_media_worker_round_trips_without_runtime_secrets(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "workspace"
+            state = root / "state"
+            workspace.mkdir()
+            worker = MediaWorkerClientConfig(
+                host="media-worker.local",
+                port=9443,
+                server_name="media-worker.local",
+                ca_certificate=root / "tls" / "ca.pem",
+                client_certificate=root / "tls" / "client.pem",
+                client_key=root / "tls" / "client-key.pem",
+            )
+            config = BridgeConfig.from_paths(
+                workspace,
+                state,
+                media_worker=worker,
+            )
+            state.mkdir()
+            path = state / "config.json"
+            path.write_text(
+                json.dumps(config.as_file_payload()),
+                encoding="utf-8",
+            )
+            path.chmod(0o600)
+
+            restored = BridgeConfig.from_file(path)
+
+        self.assertEqual(restored.media_worker, worker)
+        serialized = json.dumps(config.as_file_payload())
+        for forbidden in (
+            "bot_token",
+            "openai",
+            "proton",
+            "ssh_key",
+            "sudo",
+        ):
+            self.assertNotIn(forbidden, serialized.casefold())
+
+    def test_media_worker_client_file_is_strict_and_owner_only(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            payload = {
+                "host": "media-worker.local",
+                "port": 9443,
+                "server_name": "media-worker.local",
+                "ca_certificate": str(root / "ca.pem"),
+                "client_certificate": str(root / "client.pem"),
+                "client_key": str(root / "client-key.pem"),
+            }
+            path = root / "worker.json"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            path.chmod(0o600)
+
+            loaded = MediaWorkerClientConfig.from_file(path)
+
+            self.assertEqual(loaded.host, "media-worker.local")
+            path.chmod(0o644)
+            with self.assertRaisesRegex(ValueError, "owner-only"):
+                MediaWorkerClientConfig.from_file(path)
+            path.chmod(0o600)
+            payload["ssh_user"] = "main-user"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "unsupported fields"):
+                MediaWorkerClientConfig.from_file(path)
+
+    def test_media_worker_client_config_is_bounded(self) -> None:
+        base = {
+            "host": "media-worker.local",
+            "port": 9443,
+            "server_name": "media-worker.local",
+            "ca_certificate": "/tmp/ca.pem",
+            "client_certificate": "/tmp/client.pem",
+            "client_key": "/tmp/client-key.pem",
+        }
+        for field, invalid in (
+            ("port", 0),
+            ("port", True),
+            ("request_timeout_seconds", 0),
+            ("request_timeout_seconds", float("nan")),
+            ("processing_timeout_seconds", 301),
+            ("processing_timeout_seconds", float("inf")),
+            ("failure_threshold", 0),
+            ("failure_threshold", True),
+            ("cooldown_seconds", 3601),
+            ("cooldown_seconds", float("-inf")),
+            ("host", "worker.local@attacker.invalid"),
+            ("server_name", "*.local"),
+        ):
+            with self.subTest(field=field, invalid=invalid):
+                payload = {**base, field: invalid}
+                with self.assertRaises(ValueError):
+                    MediaWorkerClientConfig.from_payload(payload)
+
+    def test_media_worker_tls_paths_preserve_symlink_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "client.key"
+            target.write_text("private", encoding="utf-8")
+            link = root / "client-link.key"
+            link.symlink_to(target)
+
+            config = MediaWorkerClientConfig(
+                host="192.0.2.1",
+                port=9443,
+                server_name="media-worker.local",
+                ca_certificate=root / "ca.pem",
+                client_certificate=root / "client.pem",
+                client_key=link,
+            )
+
+        self.assertEqual(config.client_key.name, "client-link.key")
 
     def test_json_config_requires_owner_only_permissions(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

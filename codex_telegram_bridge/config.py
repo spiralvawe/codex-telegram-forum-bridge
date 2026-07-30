@@ -97,6 +97,7 @@ class BridgeConfig:
     initial_history_messages: int = 0
     reasoning_mode: str = "off"
     max_active_turns: int = 0
+    codex_full_access: bool = False
     compatible_codex_versions: tuple[str, ...] = DEFAULT_COMPATIBLE_CODEX_VERSIONS
     ffmpeg_binary: str = "ffmpeg"
     media_processing_timeout_seconds: float = 120
@@ -122,6 +123,8 @@ class BridgeConfig:
             raise ValueError(
                 "max_active_turns must be a non-negative integer"
             )
+        if not isinstance(self.codex_full_access, bool):
+            raise ValueError("codex_full_access must be a boolean")
 
     @property
     def database_path(self) -> Path:
@@ -147,6 +150,7 @@ class BridgeConfig:
         secret_reference: str | None = None,
         secret_vault: str | None = None,
         max_active_turns: int | None = None,
+        codex_full_access: bool = False,
     ) -> "BridgeConfig":
         workspace_path = Path(workspace).expanduser().resolve()
         selected_instance = (
@@ -216,6 +220,7 @@ class BridgeConfig:
                     )
                 )
             ),
+            codex_full_access=codex_full_access,
             ffmpeg_binary=detect_ffmpeg_binary(),
             media_processing_timeout_seconds=float(
                 os.environ.get(
@@ -324,6 +329,7 @@ class BridgeConfig:
             ),
             reasoning_mode=str(payload.get("reasoning_mode", "off")).lower(),
             max_active_turns=payload.get("max_active_turns", 0),
+            codex_full_access=payload.get("codex_full_access", False),
             compatible_codex_versions=(
                 tuple(str(value) for value in versions)
                 if isinstance(versions, list)
@@ -381,6 +387,7 @@ class BridgeConfig:
             "initial_history_messages": self.initial_history_messages,
             "reasoning_mode": self.reasoning_mode,
             "max_active_turns": self.max_active_turns,
+            "codex_full_access": self.codex_full_access,
             "media_processing_timeout_seconds": (
                 self.media_processing_timeout_seconds
             ),

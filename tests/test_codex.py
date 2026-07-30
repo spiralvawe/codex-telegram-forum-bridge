@@ -20,6 +20,7 @@ from codex_telegram_bridge.codex import (  # noqa: E402
     CodexAppServer,
     CodexProtocolCompatibilityError,
     CodexProtocolError,
+    codex_daemon_environment,
 )
 from codex_telegram_bridge.input_types import LocalInput  # noqa: E402
 
@@ -123,6 +124,7 @@ class CodexUnixWebSocketTests(unittest.IsolatedAsyncioTestCase):
         socket_path: str = "/tmp/codex-app-server.sock",
         *,
         compatible_versions: tuple[str, ...] = (),
+        full_access: bool = False,
     ) -> CodexAppServer:
         return CodexAppServer(
             codex_binary="/must/not/be/started",
@@ -131,6 +133,7 @@ class CodexUnixWebSocketTests(unittest.IsolatedAsyncioTestCase):
             on_server_request=ignore_message,
             socket_path=socket_path,
             compatible_versions=compatible_versions,
+            full_access=full_access,
         )
 
     async def test_start_connects_to_unix_websocket_and_initializes(self) -> None:
@@ -166,6 +169,18 @@ class CodexUnixWebSocketTests(unittest.IsolatedAsyncioTestCase):
             json.loads(client.sent[1]),
             {"method": "initialized", "params": {}},
         )
+
+    def test_daemon_environment_follows_configured_control_socket(self) -> None:
+        with patch.dict(
+            "codex_telegram_bridge.codex.os.environ",
+            {"CODEX_HOME": "/wrong/default"},
+            clear=True,
+        ):
+            environment = codex_daemon_environment(
+                "/srv/codex-home/app-server-control/app-server-control.sock"
+            )
+
+        self.assertEqual(environment["CODEX_HOME"], "/srv/codex-home")
 
     async def test_websocket_send_uses_one_json_frame_without_newline(self) -> None:
         server = self.make_server()
@@ -319,6 +334,90 @@ class CodexUnixWebSocketTests(unittest.IsolatedAsyncioTestCase):
         server.request.assert_awaited_once_with(
             "account/rateLimits/read",
             {},
+        )
+
+    async def test_full_access_is_explicit_on_thread_start(self) -> None:
+        server = self.make_server(full_access=True)
+        server.request = AsyncMock(
+            return_value={"thread": {"id": "thread-full-access"}}
+        )
+
+        thread = await server.start_thread()
+
+        self.assertEqual(thread["id"], "thread-full-access")
+        server.request.assert_awaited_once_with(
+            "thread/start",
+            {
+                "cwd": "/tmp",
+                "ephemeral": False,
+                "threadSource": "telegram_bridge",
+                "approvalPolicy": "never",
+                "sandbox": "danger-full-access",
+            },
+        )
+
+    async def test_full_access_is_explicit_on_thread_resume(self) -> None:
+        server = self.make_server(full_access=True)
+        server.request = AsyncMock(return_value={})
+
+        await server.resume_thread("thread-existing")
+
+        server.request.assert_awaited_once_with(
+            "thread/resume",
+            {
+                "threadId": "thread-existing",
+                "approvalPolicy": "never",
+                "sandbox": "danger-full-access",
+            },
+        )
+
+    async def test_full_access_is_explicit_on_every_turn_start(self) -> None:
+        server = self.make_server(full_access=True)
+        server._loaded_threads.add("thread-existing")
+        server.request = AsyncMock(
+            return_value={"turn": {"id": "turn-full-access"}}
+        )
+
+        await server.start_turn(
+            thread_id="thread-existing",
+            text="permission probe",
+            client_id="tg:permission-probe",
+        )
+
+        server.request.assert_awaited_once_with(
+            "turn/start",
+            {
+                "threadId": "thread-existing",
+                "input": [
+                    {
+                        "type": "text",
+                        "text": "permission probe",
+                        "text_elements": [],
+                    }
+                ],
+                "clientUserMessageId": "tg:permission-probe",
+                "approvalPolicy": "never",
+                "sandboxPolicy": {"type": "dangerFullAccess"},
+            },
+        )
+
+    async def test_default_mode_keeps_app_server_permission_defaults(
+        self,
+    ) -> None:
+        server = self.make_server()
+        server.request = AsyncMock(
+            return_value={"thread": {"id": "thread-default"}}
+        )
+
+        await server.start_thread()
+
+        server.request.assert_awaited_once_with(
+            "thread/start",
+            {
+                "cwd": "/tmp",
+                "ephemeral": False,
+                "threadSource": "telegram_bridge",
+            },
         )
 
     async def test_turn_start_preserves_native_audio_and_image_inputs(

@@ -98,6 +98,37 @@ class PortableConfigTests(unittest.TestCase):
 
         self.assertEqual(config.max_active_turns, 2)
 
+    def test_codex_full_access_is_opt_in_and_round_trips(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            default = BridgeConfig.from_paths(workspace, root / "default")
+            enabled = BridgeConfig.from_paths(
+                workspace,
+                root / "enabled",
+                codex_full_access=True,
+            )
+            path = root / "enabled.json"
+            path.write_text(
+                json.dumps(enabled.as_file_payload()),
+                encoding="utf-8",
+            )
+            path.chmod(0o600)
+            restored = BridgeConfig.from_file(path)
+
+        self.assertFalse(default.codex_full_access)
+        self.assertTrue(enabled.codex_full_access)
+        self.assertTrue(restored.codex_full_access)
+
+    def test_codex_full_access_rejects_ambiguous_values(self) -> None:
+        with self.assertRaisesRegex(ValueError, "must be a boolean"):
+            BridgeConfig(
+                workspace=Path.cwd(),
+                state_dir=Path.cwd(),
+                codex_full_access="true",  # type: ignore[arg-type]
+            )
+
     def test_negative_max_active_turns_is_rejected(self) -> None:
         with self.assertRaisesRegex(ValueError, "non-negative integer"):
             BridgeConfig(

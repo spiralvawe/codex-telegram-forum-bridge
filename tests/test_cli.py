@@ -23,6 +23,7 @@ from codex_telegram_bridge.cli import (  # noqa: E402
     main,
     mapping_health,
     queue_health_is_acceptable,
+    requirements_allow_full_access,
     setup_final_icon,
     thread_contract_is_valid,
 )
@@ -39,6 +40,37 @@ from codex_telegram_bridge.telegram import TelegramError  # noqa: E402
 
 class DoctorDesktopDetectionTests(unittest.TestCase):
     socket_path = Path("/tmp/shared-codex.sock")
+
+    def test_full_access_requirements_fail_closed(self) -> None:
+        self.assertTrue(requirements_allow_full_access(None))
+        self.assertTrue(
+            requirements_allow_full_access(
+                {
+                    "allowedApprovalPolicies": ["never", "on-request"],
+                    "allowedSandboxModes": [
+                        "danger-full-access",
+                        "workspace-write",
+                    ],
+                }
+            )
+        )
+        self.assertFalse(
+            requirements_allow_full_access(
+                {
+                    "allowedApprovalPolicies": ["on-request"],
+                    "allowedSandboxModes": ["danger-full-access"],
+                }
+            )
+        )
+        self.assertFalse(
+            requirements_allow_full_access(
+                {
+                    "allowedApprovalPolicies": ["never"],
+                    "allowedSandboxModes": ["workspace-write"],
+                }
+            )
+        )
+        self.assertFalse(requirements_allow_full_access("invalid"))  # type: ignore[arg-type]
 
     def test_running_desktop_must_have_positive_socket_peer(self) -> None:
         running, shared = detect_desktop_shared_socket(

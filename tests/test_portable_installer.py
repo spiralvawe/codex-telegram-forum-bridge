@@ -56,6 +56,51 @@ class PortableInstallerTests(unittest.TestCase):
 
         self.assertEqual(args.max_active_turns, 1)
 
+    def test_prepare_parser_accepts_explicit_codex_full_access(self) -> None:
+        args = installer.build_parser().parse_args(
+            [
+                "prepare",
+                "--workspace",
+                "/srv/project",
+                "--codex-full-access",
+            ]
+        )
+
+        self.assertTrue(args.codex_full_access)
+
+    def test_prepare_persists_explicit_codex_full_access(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "workspace"
+            state = root / "state"
+            workspace.mkdir()
+            args = installer.build_parser().parse_args(
+                [
+                    "prepare",
+                    "--workspace",
+                    str(workspace),
+                    "--state-dir",
+                    str(state),
+                    "--secret-backend",
+                    "file",
+                    "--codex-binary",
+                    "/bin/true",
+                    "--codex-full-access",
+                    "--skip-app-server-bootstrap",
+                ]
+            )
+            with (
+                mock.patch("installer.prepare_runtime"),
+                mock.patch(
+                    "installer.shutil.which",
+                    return_value="/bin/true",
+                ),
+            ):
+                result = installer.prepare(args)
+            config = BridgeConfig.from_file(result["config"])
+
+        self.assertTrue(config.codex_full_access)
+
     def test_systemd_working_directory_uses_directive_specific_syntax(
         self,
     ) -> None:

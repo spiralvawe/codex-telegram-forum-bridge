@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Add an explicit `--codex-full-access` instance mode. New threads, resumed
+  threads, and every Telegram-started turn pin `approval_policy=never` and
+  `danger-full-access`, preventing restrictive or incomplete host defaults
+  from causing repeated approval prompts. The default remains inherited from
+  the host unless the operator makes this trust decision.
+- Make manual `doctor` and protocol-version fallback follow the configured
+  App Server socket's `CODEX_HOME`, so relocated CLI homes work outside their
+  service-manager environment as well as inside it.
 - Add an optional global `max_active_turns` guard for low-memory hosts.
   Cross-Topic work remains in the durable FIFO queue until an actual terminal
   Codex state frees capacity, including after bridge restart. Outcome-unknown

@@ -157,7 +157,13 @@ with tempfile.TemporaryDirectory() as directory:
                     source != Path(installer.__file__).resolve().parent,
                 )
             )
-        return subprocess.CompletedProcess(arguments, 0, "", "")
+        stdout = ""
+        if "-c" in arguments:
+            stdout = installer.package_tree_digest(
+                Path(installer.__file__).resolve().parent
+                / "codex_telegram_bridge"
+            ) + "\n"
+        return subprocess.CompletedProcess(arguments, 0, stdout, "")
 
     with mock.patch("installer.run", side_effect=fake_run):
         installer.prepare_runtime(config)
@@ -654,6 +660,46 @@ with tempfile.TemporaryDirectory() as directory:
         self.assertIn("Never ask the user to paste the bot token", contract)
         self.assertIn("one new Telegram bot token", contract)
         self.assertIn("SETUP_WITH_CODEX.md", skill)
+
+    def test_activate_stops_running_service_before_gates_and_restores_on_failure(
+        self,
+    ) -> None:
+        config = mock.Mock()
+        config.instance_id = "test"
+        args = mock.Mock(config=Path("/tmp/config.toml"))
+        order: list[str] = []
+
+        with (
+            mock.patch.object(
+                installer.BridgeConfig,
+                "from_file",
+                return_value=config,
+            ),
+            mock.patch.object(installer, "runtime_cli") as runtime_cli,
+            mock.patch.object(
+                installer,
+                "stop_bridge_service",
+                side_effect=lambda current: order.append("stop") or True,
+            ),
+            mock.patch.object(
+                installer,
+                "bridge_command",
+                side_effect=lambda *unused: (
+                    order.append("gate"),
+                    (_ for _ in ()).throw(installer.InstallerError("failed")),
+                )[1],
+            ),
+            mock.patch.object(
+                installer,
+                "restore_bridge_service",
+                side_effect=lambda current: order.append("restore"),
+            ),
+        ):
+            runtime_cli.return_value.is_file.return_value = True
+            with self.assertRaises(installer.InstallerError):
+                installer.activate(args)
+
+        self.assertEqual(order, ["stop", "gate", "restore"])
 
 
 if __name__ == "__main__":

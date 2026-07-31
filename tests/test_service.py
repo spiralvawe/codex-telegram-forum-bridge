@@ -1691,10 +1691,18 @@ class ServiceRoutingTests(unittest.IsolatedAsyncioTestCase):
         )
         self.service.start_turn.assert_awaited_once_with(
             topic=new_topic,
-            text="🎙 Голосовой запрос",
+            text=(
+                "🎙 Голосовой запрос\n\n"
+                "Название: 2–5 слов, телеграфно; объект + "
+                "действие/состояние; привычные сокращения."
+            ),
             client_id="tg:-100500:100",
             reply_to=801,
             local_inputs=(audio,),
+        )
+        self.assertEqual(
+            self.telegram.sent_messages[-1]["text"],
+            "👤 Telegram\n\n🎙 Голосовой запрос",
         )
 
     async def test_new_thread_replay_does_not_duplicate_thread_or_turn(

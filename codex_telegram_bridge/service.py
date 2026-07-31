@@ -121,6 +121,10 @@ PROGRESS_KIND_LABELS = {
 }
 ARCHIVE_TOPIC_TITLE = "Архивные треды"
 VOICE_THREAD_PENDING_TITLE = "Распознаётся голосовая задача"
+VOICE_THREAD_TITLE_GUIDANCE = (
+    "Название: 2–5 слов, телеграфно; объект + действие/состояние; "
+    "привычные сокращения."
+)
 ARCHIVE_PAGE_SIZE = 20
 ARCHIVE_DELETE_CONCURRENCY = 6
 ARCHIVE_DELETE_CONFIRM_ATTEMPTS = 4
@@ -4945,6 +4949,11 @@ class BridgeService:
                 echo_message_id=echo_message_id,
             )
 
+        turn_prompt = (
+            f"{prompt}\n\n{VOICE_THREAD_TITLE_GUIDANCE}"
+            if defer_title_to_codex
+            else prompt
+        )
         queued = self.store.enqueue(
             thread_id=thread_id,
             chat_id=topic.chat_id,
@@ -4952,7 +4961,7 @@ class BridgeService:
             telegram_message_id=(
                 request.echo_message_id or source_message_id
             ),
-            text=prompt,
+            text=turn_prompt,
             client_id=f"tg:{self.binding.chat_id}:{source_message_id}",
             local_inputs=local_inputs,
         )

@@ -71,6 +71,32 @@ class LocalInputTests(unittest.TestCase):
 
 
 class MediaSecurityTests(unittest.TestCase):
+    def test_native_audio_guidance_is_scoped_to_media_with_audio(self) -> None:
+        voice = PreparedMedia(
+            kind="voice",
+            duration_seconds=7,
+            inputs=(LocalInput("localAudio", "/private/audio.mp3"),),
+        )
+        video = PreparedMedia(
+            kind="video_note",
+            duration_seconds=7,
+            inputs=(LocalInput("localAudio", "/private/audio.mp3"),),
+        )
+        silent = PreparedMedia(
+            kind="video_note",
+            duration_seconds=7,
+            inputs=(LocalInput("localImage", "/private/frame.jpg"),),
+        )
+
+        for prepared in (voice, video):
+            request_text = media_request_text(prepared)
+            self.assertIn("нативный аудиовход непосредственно", request_text)
+            self.assertIn("Не ищи и не требуй локальный Whisper", request_text)
+        self.assertNotIn(
+            "нативный аудиовход непосредственно",
+            media_request_text(silent),
+        )
+
     def test_local_processor_rejects_playlist_before_ffmpeg(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

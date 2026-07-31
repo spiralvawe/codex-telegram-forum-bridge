@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 0.4.2 — 2026-07-31
+
+- Restore the result-only Telegram attachment boundary: local Markdown links,
+  inline images, and native output citations are uploaded only when they
+  resolve to safe regular files below the workspace `outputs/` directory.
+- Keep technical and intermediate paths readable in final answers without
+  uploading their contents to Telegram.
+
 ## 0.4.1 — 2026-07-31
 
 - Record an owner-only deployment manifest containing the package version,

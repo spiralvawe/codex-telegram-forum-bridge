@@ -184,6 +184,13 @@ hidden prompt into an owner-only regular file outside the repository.
 - SQLite integrity, schema, queue age, unresolved delivery outcomes, and
   exact task↔Topic parity;
 - ffmpeg and private media storage.
+- the owner-only deployment manifest and deterministic installed-package
+  digest, so direct runtime edits or incomplete installs fail closed.
+
+Runtime code has one canonical path: change a branch, bump the patch version,
+test, merge the PR, and install the exact clean merge commit. The installer
+refuses an older version and refuses different package bytes under the same
+version. Never patch `site-packages` or an installed runtime directly.
 
 An unsupported Codex version keeps Telegram input durable but disables unsafe
 dispatch until a tested bridge release is installed.

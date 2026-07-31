@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## 0.4.1 — 2026-07-31
+
+- Record an owner-only deployment manifest containing the package version,
+  deterministic package digest, and source commit when available.
+- Make `doctor` fail closed when installed package files no longer match the
+  recorded deployment, detecting direct runtime edits.
+- Refuse downgrades and refuse different code under an unchanged version,
+  requiring every behavior change to receive a version bump.
+
 ## 0.4.0 — 2026-07-30
 
 - Add an opt-in, mutually authenticated LAN media worker for bounded FFmpeg

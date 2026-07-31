@@ -26,6 +26,14 @@ from codex_telegram_bridge.config import (
     default_instance_id,
     read_bot_token,
 )
+from codex_telegram_bridge.deployment import (
+    DeploymentIntegrityError,
+    deployment_manifest_path,
+    package_tree_digest,
+    package_version_from_source,
+    read_deployment_manifest,
+    validate_deployment_transition,
+)
 
 
 ROOT = Path(__file__).resolve().parent
@@ -197,6 +205,39 @@ def prepare_runtime(config: BridgeConfig) -> None:
         venv.EnvBuilder(with_pip=True).create(environment)
     python = str(runtime_python(config))
     with runtime_bootstrap_inputs() as (lock_path, install_source):
+        package_source = Path(install_source) / "codex_telegram_bridge"
+        candidate_version = package_version_from_source(package_source)
+        candidate_digest = package_tree_digest(package_source)
+        source_commit: str | None = None
+        git_directory = Path(install_source) / ".git"
+        if git_directory.exists():
+            revision = run(
+                ["git", "-C", str(install_source), "rev-parse", "HEAD"],
+                check=False,
+                capture=True,
+            )
+            cleanliness = run(
+                ["git", "-C", str(install_source), "status", "--porcelain"],
+                check=False,
+                capture=True,
+            )
+            if cleanliness.returncode != 0 or cleanliness.stdout.strip():
+                raise InstallerError(
+                    "refusing to deploy from a dirty source tree"
+                )
+            if revision.returncode == 0 and re.fullmatch(
+                r"[0-9a-f]{40}", revision.stdout.strip()
+            ):
+                source_commit = revision.stdout.strip()
+        try:
+            existing_manifest = read_deployment_manifest(config.state_dir)
+            validate_deployment_transition(
+                existing_manifest,
+                candidate_version=candidate_version,
+                candidate_digest=candidate_digest,
+            )
+        except DeploymentIntegrityError as error:
+            raise InstallerError(str(error)) from None
         run(
             [
                 python,
@@ -219,6 +260,33 @@ def prepare_runtime(config: BridgeConfig) -> None:
                 "--no-deps",
                 str(install_source),
             ]
+        )
+        installed_digest = run(
+            [
+                python,
+                "-c",
+                (
+                    "from pathlib import Path; "
+                    "import codex_telegram_bridge as package; "
+                    "from codex_telegram_bridge.deployment import "
+                    "package_tree_digest; "
+                    "print(package_tree_digest(Path(package.__file__).parent))"
+                ),
+            ],
+            capture=True,
+        ).stdout.strip()
+        if installed_digest != candidate_digest:
+            raise InstallerError(
+                "installed package digest does not match the prepared source"
+            )
+        atomic_json(
+            deployment_manifest_path(config.state_dir),
+            {
+                "formatVersion": 1,
+                "packageVersion": candidate_version,
+                "packageDigest": candidate_digest,
+                "sourceCommit": source_commit,
+            },
         )
 
 
@@ -756,18 +824,71 @@ def bridge_command(
     )
 
 
+def stop_bridge_service(config: BridgeConfig) -> bool:
+    """Stop only the long-running bridge service and report if it was active."""
+    if sys.platform == "darwin":
+        launchctl = shutil.which("launchctl") or "/bin/launchctl"
+        label = f"{SERVICE_PREFIX}.{config.instance_id.replace('-', '.')}"
+        domain = f"gui/{os.getuid()}"
+        status = run(
+            [launchctl, "print", f"{domain}/{label}"],
+            check=False,
+            capture=True,
+        )
+        was_active = status.returncode == 0
+        if was_active:
+            run(
+                [launchctl, "bootout", f"{domain}/{label}"],
+                check=False,
+                capture=True,
+            )
+        return was_active
+
+    unit = f"codex-telegram-bridge-{config.instance_id}.service"
+    status = run(
+        ["systemctl", "--user", "is-active", "--quiet", unit],
+        check=False,
+        capture=True,
+    )
+    was_active = status.returncode == 0
+    if was_active:
+        run(["systemctl", "--user", "stop", unit])
+    return was_active
+
+
+def restore_bridge_service(config: BridgeConfig) -> None:
+    """Best-effort recovery when activation gates fail after a service stop."""
+    if sys.platform == "darwin":
+        launchctl = shutil.which("launchctl") or "/bin/launchctl"
+        label = f"{SERVICE_PREFIX}.{config.instance_id.replace('-', '.')}"
+        domain = f"gui/{os.getuid()}"
+        plist = Path.home() / "Library" / "LaunchAgents" / f"{label}.plist"
+        if plist.is_file():
+            run([launchctl, "bootstrap", domain, str(plist)], check=False)
+        return
+
+    unit = f"codex-telegram-bridge-{config.instance_id}.service"
+    run(["systemctl", "--user", "start", unit], check=False)
+
+
 def activate(args: argparse.Namespace) -> dict[str, Any]:
     config = BridgeConfig.from_file(args.config)
     if not runtime_cli(config).is_file():
         raise InstallerError("Prepared runtime is missing; run prepare first")
-    bridge_command(config, "sync-once")
-    bridge_command(config, "doctor")
-    bridge_command(config, "backup", "--retention", "96")
-    services = (
-        install_launchd(config)
-        if sys.platform == "darwin"
-        else install_systemd(config)
-    )
+    was_active = stop_bridge_service(config)
+    try:
+        bridge_command(config, "sync-once")
+        bridge_command(config, "doctor")
+        bridge_command(config, "backup", "--retention", "96")
+        services = (
+            install_launchd(config)
+            if sys.platform == "darwin"
+            else install_systemd(config)
+        )
+    except Exception:
+        if was_active:
+            restore_bridge_service(config)
+        raise
     return {
         "ok": True,
         "instance": config.instance_id,

@@ -24,3 +24,11 @@ For development:
   Topic creation, messages, media uploads, archive cards, or approvals.
 - Keep runtime state outside the repository with owner-only permissions.
 - Add a regression test for every behavioral fix.
+- Treat GitHub `main` as the only canonical source. Never edit an installed
+  runtime or `site-packages` file directly, even as a temporary fix.
+- For every runtime behavior change: use a branch, add tests, bump the package
+  patch version, push a PR, review it, merge it, then install the exact clean
+  merge commit. Do not leave a change only on the host or only in GitHub.
+- After activation, require `doctor` to report deployment integrity and the
+  expected source commit. A mismatch is a release failure, not a reason to
+  patch the runtime in place.

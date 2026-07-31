@@ -21,6 +21,7 @@ from .codex import (
     codex_daemon_environment,
 )
 from .config import BridgeConfig, read_bot_token
+from .deployment import deployment_health
 from .service import BridgeService, bootstrap_group
 from .service import (
     FINAL_ANSWER_CUSTOM_EMOJI_ALT,
@@ -580,6 +581,7 @@ async def run_doctor(
         "desktopSharedSocketVerified": desktop_uses_shared is True,
         **doctor_database_health(store),
         **doctor_media_health(config),
+        **deployment_health(config.state_dir, Path(__file__).resolve().parent),
     }
     if binding:
         member = await asyncio.to_thread(
@@ -679,6 +681,7 @@ async def run_doctor(
         and result["codexVersionMatch"]
         and result["sharedSocketOwnerOnly"]
         and result["mediaInputReady"]
+        and result["deploymentIntegrity"]
         and result["databaseIntegrity"] == "ok"
         and result["queueHealthy"]
         and result["unresolvedTopicCreations"] == 0

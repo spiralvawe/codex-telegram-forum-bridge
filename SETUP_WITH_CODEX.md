@@ -17,6 +17,9 @@ follow only the Telegram and secret-manager prompts below.
    database content, or credential-bearing URLs.
 6. Stop on unsupported Codex protocol, failed tests, an unsafe runtime path, an
    ambiguous group binding, or a failed `doctor`.
+7. Never edit installed runtime or `site-packages` files. Runtime changes must
+   be tested, version-bumped, merged to the canonical repository, and deployed
+   from the exact clean merge commit.
 
 ## 1. Read-only preflight
 
@@ -169,6 +172,8 @@ Activation must:
 5. install/start launchd on macOS or a systemd user service on Linux;
 6. install/start a five-minute local-only health check and a thirty-minute
    backup job.
+7. require a matching owner-only deployment manifest and installed-package
+   digest.
 
 Then run `doctor` one more time through the installed CLI and report only
 sanitized counts and statuses.

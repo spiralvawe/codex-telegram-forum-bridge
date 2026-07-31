@@ -30,7 +30,6 @@ from codex_telegram_bridge.media import (  # noqa: E402
 from codex_telegram_bridge.service import (  # noqa: E402
     BridgeService,
     CONTROL_PROMPT_TEXT,
-    FINAL_ANSWER_CUSTOM_EMOJI_SETTING,
     NEW_THREAD_PROMPT,
     PendingServerRequest,
     PROGRESS_COLLAPSE_RESET_SECONDS,
@@ -41,6 +40,7 @@ from codex_telegram_bridge.service import (  # noqa: E402
     bootstrap_group,
     final_answer_attachments,
     format_limit_percent,
+    format_token_count,
     parse_person_review_text,
     person_review_token,
     progress_summary,
@@ -1150,6 +1150,42 @@ class ServiceRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(queued)
         self.assertEqual(queued.local_inputs, (document,))
 
+    async def test_successful_local_stt_replaces_voice_input_with_transcript(
+        self,
+    ) -> None:
+        audio = self.local_media_input(name="normalized.mp3")
+
+        def source_path(media_key: str) -> Path:
+            directory = self.service.config.media_directory / media_key
+            directory.mkdir(parents=True, mode=0o700, exist_ok=True)
+            return directory / "source.bin"
+
+        self.service.media = SimpleNamespace(
+            prune=lambda **_: MediaPruneResult(0, 0),
+            source_path=source_path,
+            prepare_voice=lambda **_: PreparedMedia(
+                kind="voice",
+                duration_seconds=7,
+                inputs=(audio,),
+            ),
+        )
+        self.service._local_stt_transcript = AsyncMock(  # type: ignore[method-assign]
+            return_value="проверить бойлер"
+        )
+
+        text, inputs = await self.service._prepare_telegram_media(
+            self.topic_media_message("voice")["message"],
+            client_id="tg:-100500:90",
+            user_text="срочно",
+        )
+
+        self.assertEqual(inputs, ())
+        self.assertEqual(
+            text,
+            "срочно\n\n🎙 Расшифровка голосового сообщения:\n"
+            "проверить бойлер",
+        )
+
     async def test_document_without_caption_still_starts_a_turn(self) -> None:
         await self.service.handle_telegram_update(
             self.topic_media_message("document")
@@ -1933,6 +1969,15 @@ class ServiceRoutingTests(unittest.IsolatedAsyncioTestCase):
                                 "phase": "final_answer",
                                 "text": f"Final from {user_origin}",
                             },
+                        },
+                    }
+                )
+                await self.service.on_codex_notification(
+                    {
+                        "method": "turn/completed",
+                        "params": {
+                            "threadId": thread_id,
+                            "turn": {"id": turn_id, "status": "completed"},
                         },
                     }
                 )
@@ -3542,14 +3587,16 @@ class ServiceRoutingTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(len(self.telegram.edited_messages), 3)
-        open_details = self.telegram.edited_messages[0]["rich_message"]["blocks"][0]
+        open_message = self.telegram.edited_messages[0]["rich_message"]
+        open_details = open_message["blocks"][1]
         self.assertIn("text", self.telegram.edited_messages[1])
-        closed_details = self.telegram.edited_messages[2]["rich_message"]["blocks"][0]
+        closed_message = self.telegram.edited_messages[2]["rich_message"]
+        closed_details = closed_message["blocks"][1]
         self.assertTrue(open_details["is_open"])
         self.assertNotIn("is_open", closed_details)
         self.assertEqual(
-            open_details["summary"],
-            "🟡 Codex работает. Ход работы Codex",
+            open_message["blocks"][0]["text"],
+            "🟡 Codex работает.",
         )
         self.assertEqual(
             closed_details["summary"],
@@ -3579,7 +3626,7 @@ class ServiceRoutingTests(unittest.IsolatedAsyncioTestCase):
             self.telegram.sent_messages[0]["reply_to_message_id"],
             90,
         )
-        self.assertIn("✅ Codex", self.telegram.sent_messages[0]["text"])
+        self.assertIn("🟢 Codex", self.telegram.sent_messages[0]["text"])
 
     def test_progress_elapsed_minutes_use_russian_grammar(self) -> None:
         self.assertEqual(
@@ -3588,7 +3635,7 @@ class ServiceRoutingTests(unittest.IsolatedAsyncioTestCase):
                 outcome="completed",
                 elapsed_minutes=0,
             ),
-            "🟡 Codex работает. Ход работы Codex",
+            "🟡 Codex работает.",
         )
         expected = {
             1: "1 минуту",
@@ -3607,10 +3654,7 @@ class ServiceRoutingTests(unittest.IsolatedAsyncioTestCase):
                         outcome="completed",
                         elapsed_minutes=minutes,
                     ),
-                    (
-                        f"🟡 Codex работает {phrase}. "
-                        "Ход работы Codex"
-                    ),
+                    f"🟡 Codex работает {phrase}.",
                 )
 
     async def test_active_progress_card_heartbeats_once_per_elapsed_minute(
@@ -3654,8 +3698,8 @@ class ServiceRoutingTests(unittest.IsolatedAsyncioTestCase):
             "blocks"
         ][0]
         self.assertEqual(
-            two_minutes["summary"],
-            "🟡 Codex работает 2 минуты. Ход работы Codex",
+            two_minutes["text"],
+            "🟡 Codex работает 2 минуты.",
         )
 
         with patch(
@@ -3669,8 +3713,8 @@ class ServiceRoutingTests(unittest.IsolatedAsyncioTestCase):
             "blocks"
         ][0]
         self.assertEqual(
-            three_minutes["summary"],
-            "🟡 Codex работает 3 минуты. Ход работы Codex",
+            three_minutes["text"],
+            "🟡 Codex работает 3 минуты.",
         )
 
         self.store.update_turn_progress_state(
@@ -3686,13 +3730,9 @@ class ServiceRoutingTests(unittest.IsolatedAsyncioTestCase):
             await self.service._refresh_progress_heartbeats()
         self.assertEqual(len(self.telegram.edited_messages), 2)
 
-    async def test_final_answer_uses_configured_custom_emoji(self) -> None:
+    async def test_final_answer_uses_green_state_marker(self) -> None:
         topic = self.store.topic_for_thread("thread-1")
         self.assertIsNotNone(topic)
-        self.store.set_setting(
-            FINAL_ANSWER_CUSTOM_EMOJI_SETTING,
-            "123456789",
-        )
 
         await self.service.mirror_item(
             topic,
@@ -3706,17 +3746,75 @@ class ServiceRoutingTests(unittest.IsolatedAsyncioTestCase):
         )
 
         sent = self.telegram.sent_messages[-1]
-        self.assertTrue(sent["text"].startswith("💻 Codex\n\n"))
-        self.assertEqual(
-            sent["entities"],
-            [
-                {
-                    "type": "custom_emoji",
-                    "offset": 0,
-                    "length": 2,
-                    "custom_emoji_id": "123456789",
-                }
-            ],
+        self.assertTrue(sent["text"].startswith("🟢 Codex\n\n"))
+        self.assertIsNone(sent["entities"])
+
+    async def test_token_footer_deduplicates_notification_and_history(self) -> None:
+        topic = self.store.topic_for_thread("thread-1")
+        self.assertIsNotNone(topic)
+        self.store.upsert_turn_context(
+            thread_id="thread-1",
+            turn_id="turn-usage",
+            source_message_id=77,
+        )
+        await self.service.on_codex_notification(
+            {
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-usage",
+                    "item": {
+                        "id": "live-final",
+                        "type": "agentMessage",
+                        "text": "Готово.",
+                        "phase": "final_answer",
+                    },
+                },
+            }
+        )
+        await self.service.on_codex_notification(
+            {
+                "method": "thread/tokenUsage/updated",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-usage",
+                    "tokenUsage": {
+                        "last": {"totalTokens": 1_200},
+                        "total": {"totalTokens": 223_000},
+                    },
+                },
+            }
+        )
+        await self.service.on_codex_notification(
+            {
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "turn": {"id": "turn-usage", "status": "completed"},
+                },
+            }
+        )
+        self.assertEqual(len(self.telegram.sent_messages), 1)
+        self.assertTrue(
+            self.telegram.sent_messages[0]["text"].endswith(
+                "\n\n(1,2k / 223k tkn)"
+            )
+        )
+
+        await self.service.mirror_item(
+            topic,
+            {
+                "id": "history-final",
+                "type": "agentMessage",
+                "text": "Готово.",
+                "phase": "final_answer",
+            },
+            turn_id="turn-usage",
+            item_origin="history",
+        )
+        self.assertEqual(len(self.telegram.sent_messages), 1)
+        self.assertTrue(
+            self.store.has_mirrored_item("thread-1", "history-final")
         )
 
     async def test_bottom_button_rerenders_completed_progress_as_collapsed(
@@ -3756,12 +3854,12 @@ class ServiceRoutingTests(unittest.IsolatedAsyncioTestCase):
         reset = self.telegram.edited_messages[0]
         self.assertEqual(
             reset["text"],
-            "Ход работы Codex",
+            "Codex закончил работу.",
         )
         self.assertNotIn("rich_message", reset)
         sleep.assert_awaited_once_with(PROGRESS_COLLAPSE_RESET_SECONDS)
         collapsed = self.telegram.edited_messages[1]
-        details = collapsed["rich_message"]["blocks"][0]
+        details = collapsed["rich_message"]["blocks"][1]
         self.assertNotIn("is_open", details)
         self.assertEqual(
             details["summary"],
@@ -3850,10 +3948,10 @@ class ServiceRoutingTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             attachments,
-            [reference.resolve(), report.resolve(), handoff.resolve()],
+            [report.resolve()],
         )
 
-    async def test_final_answer_uploads_explicit_workspace_file_link(
+    async def test_final_answer_does_not_upload_technical_workspace_link(
         self,
     ) -> None:
         topic = self.store.topic_for_thread("thread-1")
@@ -3881,11 +3979,7 @@ class ServiceRoutingTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(len(self.telegram.sent_messages), 1)
-        self.assertEqual(len(self.telegram.sent_documents), 1)
-        document = self.telegram.sent_documents[0]
-        self.assertEqual(document["file_path"], handoff.resolve())
-        self.assertEqual(document["reply_to_message_id"], 801)
-        self.assertEqual(document["caption"], "📎 handoff.md")
+        self.assertEqual(self.telegram.sent_documents, [])
         self.assertIn(
             "Инструкция — docs/handoff.md",
             self.telegram.sent_messages[0]["text"],
@@ -4387,7 +4481,7 @@ class ServiceRoutingTests(unittest.IsolatedAsyncioTestCase):
         progress = self.telegram.sent_rich_messages[0]["rich_message"]
         progress_text = "\n".join(
             block.get("text", "")
-            for block in progress["blocks"][0]["blocks"]
+            for block in progress["blocks"][1]["blocks"]
         )
         self.assertIn("документ — docs/bridge.md", progress_text)
         self.assertIn(
@@ -4609,7 +4703,7 @@ class ServiceRoutingTests(unittest.IsolatedAsyncioTestCase):
             self.telegram.edited_messages[-1]["text"],
         )
         self.assertEqual(self.telegram.edited_messages[-1]["parse_mode"], "HTML")
-        self.assertIn("✅ Codex", self.telegram.sent_messages[-1]["text"])
+        self.assertIn("🟢 Codex", self.telegram.sent_messages[-1]["text"])
         context = self.store.turn_context("thread-1", "turn-fallback")
         self.assertIsNotNone(context)
         self.assertIsNotNone(context.status_message_id)
@@ -4765,7 +4859,7 @@ class ServiceRoutingTests(unittest.IsolatedAsyncioTestCase):
             len(self.store.progress_entries("thread-1", turn_id)),
             120,
         )
-        details = rich["blocks"][0]
+        details = rich["blocks"][1]
         self.assertLessEqual(len(details["blocks"]), 101)
         self.assertIn("сохранено локально", details["blocks"][-1]["text"])
 
@@ -4799,10 +4893,10 @@ class ServiceRoutingTests(unittest.IsolatedAsyncioTestCase):
 
         closed = self.telegram.edited_messages[-1]["rich_message"]["blocks"]
         self.assertEqual(
-            closed[0]["summary"],
+            closed[0]["text"],
             "⏹ Ход работы Codex остановлен",
         )
-        self.assertNotIn("is_open", closed[0])
+        self.assertNotIn("is_open", closed[1])
         self.assertTrue(
             self.store.turn_context(
                 "thread-1",
@@ -5317,6 +5411,18 @@ class ServiceRoutingTests(unittest.IsolatedAsyncioTestCase):
         )
 
         await self.service.on_codex_notification(notification)
+        await self.service.on_codex_notification(
+            {
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "turn": {
+                        "id": "turn-final-alias",
+                        "status": "completed",
+                    },
+                },
+            }
+        )
         await self.service.sync_thread_history(
             history,
             topic,

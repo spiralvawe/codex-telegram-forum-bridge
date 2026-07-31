@@ -18,6 +18,12 @@ MEDIA_KEY_PATTERN = re.compile(r"[0-9a-f]{32}")
 DEFAULT_RETENTION_SECONDS = 30 * 24 * 60 * 60
 DEFAULT_STORAGE_LIMIT_BYTES = 512 * 1024 * 1024
 SAFE_FFMPEG_PROTOCOLS = "file"
+NATIVE_AUDIO_GUIDANCE = (
+    " Используй приложенный нативный аудиовход непосредственно. Не ищи и "
+    "не требуй локальный Whisper или иной внешний распознаватель и не "
+    "утверждай, что он нужен. Если нативное аудио действительно не удаётся "
+    "понять, сообщи именно об ошибке интерпретации вложения."
+)
 
 
 class MediaProcessingError(RuntimeError):
@@ -130,6 +136,7 @@ def media_request_text(
             "Аудио приложено к этому запросу. Воспринимай речь как основной "
             "текст пользователя и ответь по существу; отдельная расшифровка "
             "нужна только если она полезна для ответа."
+            f"{NATIVE_AUDIO_GUIDANCE}"
         )
     elif prepared.kind in {"video_note", "video"}:
         audio_text = (
@@ -149,6 +156,8 @@ def media_request_text(
             "отдельная расшифровка или покадровое описание не нужны без "
             "необходимости."
         )
+        if prepared.has_audio:
+            body += NATIVE_AUDIO_GUIDANCE
     else:
         raise ValueError("unsupported prepared media kind")
     comment = user_text.strip()

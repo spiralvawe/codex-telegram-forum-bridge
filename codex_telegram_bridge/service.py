@@ -6,6 +6,7 @@ import hashlib
 import html
 import json
 import logging
+import os
 import random
 import re
 import secrets
@@ -451,7 +452,7 @@ def _attachment_candidate(
 
 
 def final_answer_attachments(text: str, workspace: Path) -> list[Path]:
-    """Return safe local files explicitly exposed by a final answer."""
+    """Return explicit result files, never ordinary technical references."""
 
     candidates: list[Path] = []
     seen: set[Path] = set()
@@ -464,7 +465,7 @@ def final_answer_attachments(text: str, workspace: Path) -> list[Path]:
             candidate = _attachment_candidate(
                 attributes.get("path", ""),
                 workspace,
-                require_outputs_directory=False,
+                require_outputs_directory=True,
             )
             if candidate is not None and candidate not in seen:
                 seen.add(candidate)
@@ -473,7 +474,7 @@ def final_answer_attachments(text: str, workspace: Path) -> list[Path]:
             candidate = _attachment_candidate(
                 image.group(2) or image.group(3) or "",
                 workspace,
-                require_outputs_directory=False,
+                require_outputs_directory=True,
             )
             if candidate is not None and candidate not in seen:
                 seen.add(candidate)
@@ -482,7 +483,7 @@ def final_answer_attachments(text: str, workspace: Path) -> list[Path]:
             candidate = _attachment_candidate(
                 link.group(2) or link.group(3) or "",
                 workspace,
-                require_outputs_directory=False,
+                require_outputs_directory=True,
             )
             if candidate is not None and candidate not in seen:
                 seen.add(candidate)
@@ -629,12 +630,14 @@ def progress_summary(
             if elapsed_minutes > 0
             else ""
         )
-        return f"🟡 Codex работает{elapsed}. {PROGRESS_DETAILS_TITLE}"
+        return f"🟡 Codex работает{elapsed}."
     if outcome == "failed":
         return f"⚠️ {PROGRESS_DETAILS_TITLE}: ошибка"
     if outcome == "interrupted":
         return f"⏹ {PROGRESS_DETAILS_TITLE} остановлен"
-    return PROGRESS_DETAILS_TITLE
+    if elapsed_minutes > 0:
+        return f"Codex работал {russian_elapsed_minutes(elapsed_minutes)}."
+    return "Codex закончил работу."
 
 
 def progress_entry_body(entry: ProgressEntry, index: int) -> str:
@@ -717,13 +720,16 @@ def build_rich_progress_message(
             detail_blocks.append({"type": "footer", "text": note})
     details: dict[str, Any] = {
         "type": "details",
-        "summary": summary,
+        "summary": PROGRESS_DETAILS_TITLE,
         "blocks": detail_blocks,
     }
     if not closed:
         details["is_open"] = True
     return {
-        "blocks": [details],
+        "blocks": [
+            {"type": "paragraph", "text": summary},
+            details,
+        ],
         "skip_entity_detection": True,
     }
 
@@ -1342,6 +1348,20 @@ def format_limit_percent(value: float) -> str:
     return f"{rounded:.1f}".replace(".", ",")
 
 
+def format_token_count(value: int) -> str:
+    value = max(0, int(value))
+    if value < 1_000:
+        return str(value)
+    if value < 1_000_000:
+        scaled = round(value / 1_000, 1)
+        suffix = "k"
+    else:
+        scaled = round(value / 1_000_000, 1)
+        suffix = "m"
+    rendered = f"{scaled:.1f}".rstrip("0").rstrip(".")
+    return rendered.replace(".", ",") + suffix
+
+
 class BridgeService:
     def __init__(
         self,
@@ -1411,6 +1431,12 @@ class BridgeService:
             tuple[str, str, str],
             dict[str, Any],
         ] = {}
+        self._pending_final_items: dict[
+            tuple[str, str],
+            dict[str, Any],
+        ] = {}
+        self._turn_token_usage: dict[tuple[str, str], tuple[int, int]] = {}
+        self._thread_token_totals: dict[str, int] = {}
         self._terminal_turns: dict[tuple[str, str], None] = {}
         self._telegram_slots = asyncio.Semaphore(16)
         self._topic_create_lock = asyncio.Lock()
@@ -1977,6 +2003,58 @@ class BridgeService:
             return "video", video
         return None
 
+    async def _local_stt_transcript(
+        self,
+        prepared: PreparedMedia,
+    ) -> str | None:
+        command = os.environ.get("CODEX_TELEGRAM_LOCAL_STT_COMMAND", "").strip()
+        if not command or prepared.kind != "voice":
+            return None
+        audio = next(
+            (item.path for item in prepared.inputs if item.kind == "localAudio"),
+            None,
+        )
+        if not audio:
+            return None
+        command_path = Path(command).expanduser().resolve(strict=False)
+        try:
+            status = command_path.stat()
+            if (
+                command_path.is_symlink()
+                or not command_path.is_file()
+                or status.st_uid != os.getuid()
+                or not os.access(command_path, os.X_OK)
+            ):
+                return None
+        except OSError:
+            return None
+        timeout = max(
+            1,
+            int(os.environ.get("CODEX_TELEGRAM_LOCAL_STT_TIMEOUT_SECONDS", "210")),
+        )
+        max_duration = max(
+            1,
+            int(os.environ.get("CODEX_TELEGRAM_LOCAL_STT_MAX_DURATION_SECONDS", "60")),
+        )
+        try:
+            process = await asyncio.create_subprocess_exec(
+                str(command_path),
+                audio,
+                "--duration-seconds",
+                str(prepared.duration_seconds),
+                "--max-duration-seconds",
+                str(max_duration),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            stdout, _ = await asyncio.wait_for(process.communicate(), timeout=timeout)
+        except (OSError, ValueError, asyncio.TimeoutError):
+            return None
+        if process.returncode != 0:
+            return None
+        transcript = stdout.decode("utf-8", errors="replace").strip()
+        return transcript[:8_000] or None
+
     async def _prepare_telegram_media(
         self,
         message: dict[str, Any],
@@ -2083,8 +2161,15 @@ class BridgeService:
                 duration_seconds=duration,
             )
         if kind != "document":
-            prepared_text = media_request_text(prepared, user_text=user_text)
-            prepared_inputs = prepared.inputs
+            transcript = await self._local_stt_transcript(prepared)
+            if transcript is not None:
+                prepared_text = (
+                    f"{user_text.strip()}\n\n" if user_text.strip() else ""
+                ) + f"🎙 Расшифровка голосового сообщения:\n{transcript}"
+                prepared_inputs = ()
+            else:
+                prepared_text = media_request_text(prepared, user_text=user_text)
+                prepared_inputs = prepared.inputs
         await asyncio.to_thread(
             self.media.prune,
             protected_paths=(
@@ -7070,6 +7155,7 @@ class BridgeService:
         item_id = str(item.get("id") or "")
         item_type = str(item.get("type") or "unknown")
         text: str | None = None
+        delivery_fingerprint_text: str | None = None
         message_entities: list[dict[str, Any]] | None = None
         attachments: list[OutboundAttachment] = []
         attachment_delivery_type = "threadAttachment"
@@ -7180,28 +7266,25 @@ class BridgeService:
                     body += "\n\n" + "\n".join(
                         f"⚠️ {warning}" for warning in attachment_warnings
                     )
+                delivery_fingerprint_text = f"🟢 Codex\n\n{body}"
+                usage = (
+                    self._turn_token_usage.get((topic.thread_id, turn_id))
+                    if turn_id
+                    else None
+                )
+                if usage is not None:
+                    turn_tokens, thread_tokens = usage
+                    body += (
+                        "\n\n"
+                        f"({format_token_count(turn_tokens)} / "
+                        f"{format_token_count(thread_tokens)} tkn)"
+                    )
                 await self._finalize_progress_card(
                     topic,
                     turn_id=turn_id,
                     outcome="completed",
                 )
-                custom_emoji_id = self.store.get_setting(
-                    FINAL_ANSWER_CUSTOM_EMOJI_SETTING
-                )
-                if custom_emoji_id:
-                    text = (
-                        f"{FINAL_ANSWER_CUSTOM_EMOJI_ALT} Codex\n\n{body}"
-                    )
-                    message_entities = [
-                        {
-                            "type": "custom_emoji",
-                            "offset": 0,
-                            "length": 2,
-                            "custom_emoji_id": custom_emoji_id,
-                        }
-                    ]
-                else:
-                    text = f"✅ Codex\n\n{body}"
+                text = f"🟢 Codex\n\n{body}"
         elif item_type in {"imageGeneration", "imageView"}:
             (
                 attachments,
@@ -7243,7 +7326,7 @@ class BridgeService:
                         + "\0"
                         + str(item.get("phase") or "")
                         + "\0"
-                        + safe_text
+                        + (delivery_fingerprint_text or safe_text)
                         + "\0"
                         + "\0".join(
                             attachment.fingerprint
@@ -7480,6 +7563,30 @@ class BridgeService:
             if topic is not None and not topic.archived:
                 await self._sync_topic_mode_title(topic, mode=mode)
             return
+        if method == "thread/tokenUsage/updated":
+            turn_id = str(params.get("turnId") or "")
+            usage = dict(params.get("tokenUsage") or {})
+            last = dict(usage.get("last") or {})
+            total = dict(usage.get("total") or {})
+            last_tokens = max(0, int(last.get("totalTokens") or 0))
+            thread_tokens = max(0, int(total.get("totalTokens") or 0))
+            if thread_id and turn_id and thread_tokens:
+                previous_total = self._thread_token_totals.get(thread_id)
+                delta = (
+                    max(0, thread_tokens - previous_total)
+                    if previous_total is not None
+                    else last_tokens
+                )
+                current_turn, _ = self._turn_token_usage.get(
+                    (thread_id, turn_id),
+                    (0, thread_tokens),
+                )
+                self._turn_token_usage[(thread_id, turn_id)] = (
+                    current_turn + delta,
+                    thread_tokens,
+                )
+                self._thread_token_totals[thread_id] = thread_tokens
+            return
         if method == "turn/started":
             turn = params.get("turn") or {}
             turn_id = str(turn.get("id") or "")
@@ -7520,6 +7627,22 @@ class BridgeService:
                     ),
                     None,
                 )
+            if (
+                thread_id
+                and notification_turn_id
+                and item.get("type") == "agentMessage"
+                and item.get("phase") == "final_answer"
+            ):
+                self._pending_final_items[
+                    (thread_id, notification_turn_id)
+                ] = dict(item)
+                context = self.store.turn_context(
+                    thread_id,
+                    notification_turn_id,
+                )
+                if context is None or context.source_message_id is None:
+                    self._sync_requested.set()
+                return
             context = (
                 self.store.turn_context(thread_id, notification_turn_id)
                 if notification_turn_id
@@ -7561,6 +7684,26 @@ class BridgeService:
                 if key[0] == thread_id and key[1] == turn_id:
                     self._started_items.pop(key, None)
             topic = self.store.topic_for_thread(thread_id)
+            pending_final = self._pending_final_items.pop(
+                (thread_id, turn_id),
+                None,
+            )
+            context = self.store.turn_context(thread_id, turn_id)
+            if (
+                topic
+                and not topic.archived
+                and pending_final
+                and context is not None
+                and context.source_message_id is not None
+            ):
+                await self.mirror_item(
+                    topic,
+                    pending_final,
+                    turn_id=turn_id,
+                    item_origin="notification",
+                )
+            elif pending_final:
+                self._sync_requested.set()
             if topic and not topic.archived:
                 await self._finalize_progress_card(
                     topic,
@@ -7582,6 +7725,10 @@ class BridgeService:
                 )
             if capacity_released:
                 await self.dispatch_queued_capacity()
+            if not pending_final or (
+                context is not None and context.source_message_id is not None
+            ):
+                self._turn_token_usage.pop((thread_id, turn_id), None)
             return
         if method == "serverRequest/resolved":
             request_id = str(params.get("requestId") or "")

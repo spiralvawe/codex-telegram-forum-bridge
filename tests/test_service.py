@@ -2857,6 +2857,40 @@ class ServiceRoutingTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
+    async def test_telegram_loop_uses_short_poll_after_repeated_failures(self) -> None:
+        self.service._retry_jitter = lambda: 0.5
+        self.service._tg = AsyncMock(
+            side_effect=[
+                RuntimeError("broken long poll"),
+                RuntimeError("broken long poll"),
+                RuntimeError("broken long poll"),
+                [],
+                asyncio.CancelledError(),
+            ]
+        )
+
+        with patch(
+            "codex_telegram_bridge.service.asyncio.sleep",
+            new=AsyncMock(),
+        ):
+            with self.assertRaises(asyncio.CancelledError):
+                await self.service.telegram_loop()
+
+        timeouts = [call.kwargs["timeout"] for call in self.service._tg.await_args_list]
+        self.assertEqual(timeouts[:4], [25, 25, 25, 0])
+        self.assertEqual(self.service.telegram_update_health.consecutive_failures, 0)
+
+    def test_watchdog_rejects_only_stale_repeated_local_fault(self) -> None:
+        self.service.telegram_update_health.record_failure("network_error")
+        self.service.telegram_update_health.consecutive_failures = 4
+        self.service._telegram_update_started_at = 1.0
+        with patch("codex_telegram_bridge.service.time.time", return_value=1000.0):
+            self.assertTrue(self.service.local_watchdog_healthy())
+
+        self.service.telegram_update_health.last_error_kind = "unexpected"
+        with patch("codex_telegram_bridge.service.time.time", return_value=1000.0):
+            self.assertFalse(self.service.local_watchdog_healthy())
+
     async def test_protocol_sync_failure_requests_reconnect(
         self,
     ) -> None:

@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 import socket
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 
 
 class SystemdNotifier:
@@ -68,10 +68,14 @@ class SystemdNotifier:
             return False
         return True
 
-    async def watchdog_loop(self) -> None:
+    async def watchdog_loop(
+        self,
+        healthy: Callable[[], bool] | None = None,
+    ) -> None:
         interval = self.watchdog_interval_seconds
         if interval is None:
             return
         while True:
             await asyncio.sleep(interval)
-            self.notify("WATCHDOG=1")
+            if healthy is None or healthy():
+                self.notify("WATCHDOG=1")

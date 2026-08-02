@@ -86,6 +86,30 @@ class SystemdNotifierTests(unittest.IsolatedAsyncioTestCase):
                 task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
 
+    async def test_watchdog_suppresses_heartbeat_when_unhealthy(self) -> None:
+        notifier = SystemdNotifier(
+            socket_address="/unused",
+            watchdog_usec=3_000_000,
+        )
+        checks = iter([False, True])
+        sent = asyncio.Event()
+
+        def record(_: str) -> bool:
+            sent.set()
+            return True
+
+        with mock.patch.object(notifier, "notify", side_effect=record) as notify:
+            task = asyncio.create_task(
+                notifier.watchdog_loop(lambda: next(checks))
+            )
+            try:
+                await asyncio.wait_for(sent.wait(), timeout=3)
+            finally:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+        notify.assert_called_once_with("WATCHDOG=1")
+
 
 if __name__ == "__main__":
     unittest.main()

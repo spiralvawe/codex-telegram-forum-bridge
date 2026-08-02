@@ -41,6 +41,11 @@ from .outbound_media import (
     OutboundMediaError,
     OutboundMediaResolver,
 )
+from .runtime_health import (
+    TELEGRAM_UPDATE_LOCAL_FAILURES,
+    TELEGRAM_UPDATE_STALE_SECONDS,
+    write_telegram_update_health,
+)
 from .store import (
     ArchivedThread,
     Binding,
@@ -1034,15 +1039,17 @@ class LoopHealth:
     last_success_at: float | None = None
     last_error_at: float | None = None
     last_error_kind: str | None = None
+    last_error_type: str | None = None
     consecutive_failures: int = 0
 
     def record_success(self) -> None:
         self.last_success_at = time.time()
         self.consecutive_failures = 0
 
-    def record_failure(self, kind: str) -> None:
+    def record_failure(self, kind: str, error_type: str | None = None) -> None:
         self.last_error_at = time.time()
         self.last_error_kind = kind
+        self.last_error_type = error_type
         self.consecutive_failures += 1
 
 
@@ -1456,6 +1463,8 @@ class BridgeService:
         self._recovery_notice_pending = False
         self._initial_sync = True
         self.telegram_update_health = LoopHealth()
+        self._telegram_update_started_at = time.time()
+        self._telegram_update_health_persisted_at = 0.0
         self.thread_sync_health = LoopHealth()
         self._retry_jitter = random.random
         self._reported_unresolved_topic_creation_count: int | None = None
@@ -1870,12 +1879,19 @@ class BridgeService:
     async def telegram_loop(self) -> None:
         offset = self.store.telegram_offset()
         retry_attempt = 0
+        self._persist_telegram_update_health(force=True)
         while True:
             try:
+                poll_timeout = (
+                    0
+                    if self.telegram_update_health.consecutive_failures
+                    >= TELEGRAM_UPDATE_LOCAL_FAILURES
+                    else self.config.telegram_long_poll_seconds
+                )
                 updates = await self._tg(
                     "get_updates",
                     offset=offset,
-                    timeout=self.config.telegram_long_poll_seconds,
+                    timeout=poll_timeout,
                 )
                 for update in updates:
                     update_id = int(update["update_id"])
@@ -1888,7 +1904,9 @@ class BridgeService:
                 raise
             except Exception as error:
                 kind = loop_error_kind(error)
-                self.telegram_update_health.record_failure(kind)
+                error_type = type(error).__name__
+                self.telegram_update_health.record_failure(kind, error_type)
+                self._persist_telegram_update_health(force=True)
                 delay = exponential_backoff_delay(
                     retry_attempt,
                     initial_seconds=TELEGRAM_UPDATE_BACKOFF_INITIAL_SECONDS,
@@ -1898,14 +1916,58 @@ class BridgeService:
                 )
                 retry_attempt += 1
                 LOGGER.warning(
-                    "Telegram update loop failed; kind=%s; retrying in %.2fs",
+                    "Telegram update loop failed; kind=%s; error_type=%s; "
+                    "retrying in %.2fs",
                     kind,
+                    error_type,
                     delay,
                 )
                 await asyncio.sleep(delay)
             else:
                 retry_attempt = 0
+                recovered = self.telegram_update_health.consecutive_failures > 0
                 self.telegram_update_health.record_success()
+                self._persist_telegram_update_health(force=recovered)
+
+    def _persist_telegram_update_health(self, *, force: bool = False) -> None:
+        health = self.telegram_update_health
+        now = time.time()
+        if not force and now - self._telegram_update_health_persisted_at < 60.0:
+            return
+        try:
+            write_telegram_update_health(
+                self.config.state_dir,
+                {
+                    "pid": os.getpid(),
+                    "startedAt": self._telegram_update_started_at,
+                    "lastSuccessAt": health.last_success_at,
+                    "lastErrorAt": health.last_error_at,
+                    "lastErrorKind": health.last_error_kind,
+                    "lastErrorType": health.last_error_type,
+                    "consecutiveFailures": health.consecutive_failures,
+                    "updatedAt": now,
+                },
+            )
+            self._telegram_update_health_persisted_at = now
+        except OSError as error:
+            LOGGER.warning(
+                "Telegram update health persistence failed; error_type=%s",
+                type(error).__name__,
+            )
+
+    def local_watchdog_healthy(self) -> bool:
+        health = self.telegram_update_health
+        if (
+            health.last_error_kind != "unexpected"
+            or health.consecutive_failures < TELEGRAM_UPDATE_LOCAL_FAILURES
+        ):
+            return True
+        reference = (
+            health.last_success_at
+            if health.last_success_at is not None
+            else self._telegram_update_started_at
+        )
+        return time.time() - reference <= TELEGRAM_UPDATE_STALE_SECONDS
 
     async def thread_sync_loop(self) -> None:
         retry_attempt = 0

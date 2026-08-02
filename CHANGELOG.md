@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Persist owner-only Telegram update-loop health and make a running bridge's
+  `doctor` fail closed when inbound polling is stale, failed, or unobserved.
+- Classify dropped HTTP connections as retryable network failures and switch
+  to a short recovery poll after repeated long-poll failures, clearing stale
+  transport state without operator intervention.
+- Gate systemd watchdog heartbeats on repeated stale local polling failures so
+  a half-working process is restarted, while external network outages do not
+  cause restart loops.
+
 ## 0.4.2 — 2026-07-31
 
 - Restore the result-only Telegram attachment boundary: local Markdown links,

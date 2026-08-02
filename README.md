@@ -186,6 +186,8 @@ hidden prompt into an owner-only regular file outside the repository.
 - ffmpeg and private media storage.
 - the owner-only deployment manifest and deterministic installed-package
   digest, so direct runtime edits or incomplete installs fail closed.
+- live inbound Telegram polling freshness and consecutive failures whenever a
+  bridge process is running; missing or stale runtime health fails closed.
 
 Runtime code has one canonical path: change a branch, bump the patch version,
 test, merge the PR, and install the exact clean merge commit. The installer
@@ -201,7 +203,11 @@ The Linux service uses systemd readiness notification and a watchdog. An
 unexpected exit of any critical internal loop terminates the process so the
 service manager can restart the whole bridge instead of leaving a
 half-working PID. Both systemd and launchd restart the bridge after any
-unintended exit. Health checks are time-bounded.
+unintended exit. Repeated long-poll failures trigger a short recovery poll.
+On Linux, a stale repeated local polling fault suppresses watchdog heartbeats
+so systemd replaces the half-working process. Classified external network
+outages keep the process alive and retrying instead of causing restart loops.
+Health checks are time-bounded.
 
 Activation also installs a backup job. It takes a consistent snapshot while
 the bridge is running through SQLite's online backup API, checks the schema
@@ -216,11 +222,13 @@ Backup creation, publication, and pruning are serialized across processes.
 The next successful run removes only strictly named owner-owned temporary
 files left by an interrupted prior backup.
 
-`probe-local` checks only SQLite and the local Codex App Server. It deliberately
-does not read the Telegram token or treat Telegram, OpenAI, DNS, or Internet
-outages as reasons to restart local services. The installed five-minute health
-job uses this local probe; run the full network-aware `doctor` manually after
-installation, updates, or recovery.
+`probe-local` checks SQLite and the local Codex App Server and reports the
+last persisted Telegram polling health for observability. Its `ok` result
+deliberately ignores that Telegram field: the root guard must not restart the
+App Server because Telegram, DNS, or Internet is unavailable. The bridge's
+own watchdog handles stale local polling faults. The installed five-minute
+health job uses this local probe; run the full network-aware `doctor` manually
+after installation, updates, or recovery.
 
 These snapshots protect against application and database failures on the same
 host. They are not disaster recovery for a failed disk, stolen computer,

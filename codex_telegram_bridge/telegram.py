@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import http.client
 import json
 import mimetypes
 import os
@@ -205,6 +206,14 @@ class TelegramAPI:
                 f"{method}: Telegram network error",
                 method=method,
                 kind="network_timeout",
+                retryable=True,
+                outcome_ambiguous=_is_side_effecting_method(method),
+            ) from error
+        except (ConnectionError, http.client.HTTPException, OSError) as error:
+            raise TelegramError(
+                f"{method}: Telegram network error",
+                method=method,
+                kind="network_error",
                 retryable=True,
                 outcome_ambiguous=_is_side_effecting_method(method),
             ) from error

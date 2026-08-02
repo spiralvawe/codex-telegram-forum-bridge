@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import http.client
 import json
 import os
 import sys
@@ -583,6 +584,20 @@ class TelegramErrorTests(unittest.TestCase):
         self.assertEqual(error.kind, "network_error")
         self.assertTrue(error.retryable)
         self.assertFalse(error.outcome_ambiguous)
+
+    def test_remote_disconnect_is_a_retryable_network_error(self) -> None:
+        with (
+            patch(
+                "codex_telegram_bridge.telegram.urllib.request.urlopen",
+                side_effect=http.client.RemoteDisconnected("closed"),
+            ),
+            self.assertRaises(TelegramError) as raised,
+        ):
+            self.telegram.call("getUpdates", {})
+
+        self.assertEqual(raised.exception.kind, "network_error")
+        self.assertTrue(raised.exception.retryable)
+        self.assertFalse(raised.exception.outcome_ambiguous)
 
     def test_side_effecting_http_5xx_is_retryable_and_ambiguous(self) -> None:
         http_error = urllib.error.HTTPError(

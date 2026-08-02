@@ -27,6 +27,7 @@ from .service import (
     FINAL_ANSWER_CUSTOM_EMOJI_ALT,
     FINAL_ANSWER_CUSTOM_EMOJI_SETTING,
 )
+from .runtime_health import read_telegram_update_health
 from .store import (
     OPERATIONAL_BACKUP_RETENTION,
     BridgeStore,
@@ -406,6 +407,7 @@ async def run_local_probe(
 
     result: dict[str, Any] = {
         **database,
+        **read_telegram_update_health(config.state_dir),
         "codexAppServer": app_server_healthy,
         "codexProtocolSmoke": app_server_healthy,
     }
@@ -532,6 +534,14 @@ async def run_doctor(
     except (OSError, subprocess.TimeoutExpired):
         process_result = subprocess.CompletedProcess([], 1, "", "")
     process_lines = process_result.stdout.splitlines()
+    bridge_process_running = any(
+        "serve" in line
+        and (
+            "codex-telegram-bridge" in line
+            or "codex_telegram_bridge" in line
+        )
+        for line in process_lines
+    )
     lsof_binary = shutil.which("lsof")
     try:
         if not lsof_binary:
@@ -579,7 +589,9 @@ async def run_doctor(
         "desktopRunning": desktop_running,
         "desktopUsesSharedAppServer": desktop_uses_shared,
         "desktopSharedSocketVerified": desktop_uses_shared is True,
+        "bridgeProcessRunning": bridge_process_running,
         **doctor_database_health(store),
+        **read_telegram_update_health(config.state_dir),
         **doctor_media_health(config),
         **deployment_health(config.state_dir, Path(__file__).resolve().parent),
     }
@@ -684,6 +696,13 @@ async def run_doctor(
         and result["deploymentIntegrity"]
         and result["databaseIntegrity"] == "ok"
         and result["queueHealthy"]
+        and (
+            not bridge_process_running
+            or (
+                result.get("telegramUpdateLoopObserved") is True
+                and result.get("telegramUpdateLoopHealthy") is True
+            )
+        )
         and result["unresolvedTopicCreations"] == 0
         and result["pendingArchiveDeletions"] == 0
         and result.get("codexProtocolSmoke") is True
@@ -739,7 +758,7 @@ async def run_serve(
         with contextlib.suppress(NotImplementedError):
             loop.add_signal_handler(signal_name, service.stop)
     watchdog_task = asyncio.create_task(
-        notifier.watchdog_loop(),
+        notifier.watchdog_loop(service.local_watchdog_healthy),
         name="systemd-watchdog-loop",
     )
     try:

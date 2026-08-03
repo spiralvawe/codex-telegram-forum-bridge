@@ -41,6 +41,7 @@ from codex_telegram_bridge.media_worker import (  # noqa: E402
     _parse_status_manifest,
     _process_group_rss_bytes,
     _status_manifest,
+    _validate_artifact_set,
 )
 
 
@@ -193,6 +194,30 @@ class ProtocolValidationTests(unittest.TestCase):
             _parse_status_manifest(
                 manifest,
                 expected=request,
+                max_output_bytes=MAX_OUTPUT_BYTES,
+            )
+
+    def test_transcript_artifact_is_only_valid_for_transcript_jobs(self) -> None:
+        artifact = _Artifact.from_dict(
+            {
+                "name": "transcript.txt",
+                "content_type": "text/plain; charset=utf-8",
+                "length": 12,
+                "sha256": "d" * 64,
+            }
+        )
+        _validate_artifact_set(
+            (artifact,),
+            kind="transcript",
+            max_output_bytes=MAX_OUTPUT_BYTES,
+        )
+        with self.assertRaisesRegex(
+            MediaWorkerProtocolError,
+            "unordered_artifacts",
+        ):
+            _validate_artifact_set(
+                (artifact,),
+                kind="voice",
                 max_output_bytes=MAX_OUTPUT_BYTES,
             )
 

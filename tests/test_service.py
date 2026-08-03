@@ -4,6 +4,7 @@ import asyncio
 import base64
 import hashlib
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -1185,6 +1186,41 @@ class ServiceRoutingTests(unittest.IsolatedAsyncioTestCase):
             "срочно\n\n🎙 Расшифровка голосового сообщения:\n"
             "проверить бойлер",
         )
+
+    async def test_local_stt_is_not_admitted_while_a_turn_is_active(
+        self,
+    ) -> None:
+        self.service.busy_threads.add("thread-1")
+        self.service._linux_available_memory_bytes = (  # type: ignore[method-assign]
+            lambda: 2 * 1024 * 1024 * 1024
+        )
+
+        self.assertEqual(
+            self.service._local_stt_admission_reason(),
+            "active_turn",
+        )
+
+    async def test_local_stt_is_not_admitted_under_memory_floor(
+        self,
+    ) -> None:
+        self.service._linux_available_memory_bytes = (  # type: ignore[method-assign]
+            lambda: 449 * 1024 * 1024
+        )
+
+        self.assertEqual(
+            self.service._local_stt_admission_reason(),
+            "low_memory",
+        )
+
+    async def test_local_stt_memory_floor_can_be_overridden(self) -> None:
+        self.service._linux_available_memory_bytes = (  # type: ignore[method-assign]
+            lambda: 128 * 1024 * 1024
+        )
+        with patch.dict(
+            os.environ,
+            {"CODEX_TELEGRAM_LOCAL_STT_MIN_AVAILABLE_MEMORY_MIB": "96"},
+        ):
+            self.assertIsNone(self.service._local_stt_admission_reason())
 
     async def test_document_without_caption_still_starts_a_turn(self) -> None:
         await self.service.handle_telegram_update(

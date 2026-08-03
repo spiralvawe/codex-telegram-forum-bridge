@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Keep Telegram responsive on small Linux hosts during voice requests: local
+  STT is now skipped, with native-audio fallback retained, while any Codex
+  turn is active or available memory is below a conservative 450 MiB floor.
+  Operators may raise that floor with
+  `CODEX_TELEGRAM_LOCAL_STT_MIN_AVAILABLE_MEMORY_MIB`.
+
 - Persist owner-only Telegram update-loop health and make a running bridge's
   `doctor` fail closed when inbound polling is stale, failed, or unobserved.
 - Classify dropped HTTP connections as retryable network failures and switch

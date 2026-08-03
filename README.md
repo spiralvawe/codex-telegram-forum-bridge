@@ -105,6 +105,14 @@ can be supplied as `CODEX_TELEGRAM_MAX_ACTIVE_TURNS` before `prepare`, or as
 whose result is unknown continues to occupy capacity across reconnects until
 Codex history safely reconciles it.
 
+When the optional local STT hook is configured on Linux, a voice message still
+falls back to its native audio input whenever any Codex turn is active or less
+than 450 MiB is immediately available. This keeps the Telegram polling process
+responsive on small hosts instead of trading connectivity for a transcript.
+The memory floor can only be raised or lowered deliberately through
+`CODEX_TELEGRAM_LOCAL_STT_MIN_AVAILABLE_MEMORY_MIB`; invalid values retain the
+450 MiB default.
+
 `--codex-full-access` is an explicit trust decision. It makes every new,
 resumed, and Telegram-started Codex turn use `approval_policy=never` and the
 `danger-full-access` sandbox, even if the host Codex defaults are more

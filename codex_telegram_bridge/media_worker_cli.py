@@ -117,11 +117,25 @@ def probe_configuration(config: MediaWorkerConfig) -> dict[str, object]:
         os.R_OK | os.W_OK | os.X_OK,
     )
     executable_ready = os.access(config.ffmpeg_binary, os.X_OK)
+    transcription_ready = (
+        config.transcriber_binary is None
+        or (
+            os.access(config.transcriber_binary, os.X_OK)
+            and config.transcriber_model is not None
+            and os.access(config.transcriber_model, os.R_OK)
+        )
+    )
     return {
-        "ok": bool(tls_valid and state_accessible and executable_ready),
+        "ok": bool(
+            tls_valid
+            and state_accessible
+            and executable_ready
+            and transcription_ready
+        ),
         "configurationOwnerOnly": True,
         "stateDirectoryReady": state_accessible,
         "ffmpegReady": executable_ready,
+        "transcriptionReady": transcription_ready,
         "mutualTlsReady": tls_valid,
         "queueCapacity": config.queue_capacity,
         "concurrency": config.concurrency,
@@ -153,10 +167,14 @@ def create_server(
         server_factory = server_factory or server_class
         processor_factory = processor_factory or processor_class
     selected_context = ssl_context or build_tls_context(config)
-    processor = processor_factory(
-        ffmpeg_binary=config.ffmpeg_binary,
-        timeout_seconds=config.processing_timeout_seconds,
-    )
+    processor_arguments: dict[str, object] = {
+        "ffmpeg_binary": config.ffmpeg_binary,
+        "timeout_seconds": config.processing_timeout_seconds,
+    }
+    if config.transcriber_binary is not None:
+        processor_arguments["transcriber_binary"] = config.transcriber_binary
+        processor_arguments["transcriber_model"] = config.transcriber_model
+    processor = processor_factory(**processor_arguments)
     return server_factory(
         **config.server_keyword_arguments(
             ssl_context=selected_context,

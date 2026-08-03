@@ -54,8 +54,9 @@ FFMPEG_MAX_ALLOC_BYTES = 128 * 1024 * 1024
 FFMPEG_MAX_PIXELS = 16_777_216
 FFMPEG_PROCESS_GROUP_RSS_LIMIT_BYTES = 512 * 1024 * 1024
 FFMPEG_MONITOR_INTERVAL_SECONDS = 0.01
+TRANSCRIPT_MAX_BYTES = 64 * 1024
 
-MEDIA_KINDS = frozenset({"voice", "video", "video_note"})
+MEDIA_KINDS = frozenset({"transcript", "voice", "video", "video_note"})
 MEDIA_KEY_PATTERN = re.compile(r"[0-9a-f]{32}")
 JOB_ID_PATTERN = re.compile(r"[0-9a-f]{64}")
 SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
@@ -300,6 +301,8 @@ class _Artifact:
         )
         if artifact.name == "audio.mp3":
             expected_type = "audio/mpeg"
+        elif artifact.name == "transcript.txt":
+            expected_type = "text/plain; charset=utf-8"
         elif FRAME_NAME_PATTERN.fullmatch(artifact.name):
             expected_type = "image/jpeg"
         else:
@@ -308,7 +311,8 @@ class _Artifact:
             raise MediaWorkerProtocolError("invalid_artifact_type")
         if (
             artifact.length <= 0
-            or artifact.length > MAX_ARTIFACT_BYTES
+            or artifact.length
+            > (TRANSCRIPT_MAX_BYTES if artifact.name == "transcript.txt" else MAX_ARTIFACT_BYTES)
             or SHA256_PATTERN.fullmatch(artifact.sha256) is None
         ):
             raise MediaWorkerProtocolError("invalid_artifact_metadata")
@@ -365,6 +369,12 @@ def _validate_artifact_set(
     kind: str,
     max_output_bytes: int,
 ) -> None:
+    if kind == "transcript":
+        if len(artifacts) != 1 or artifacts[0].name != "transcript.txt":
+            raise MediaWorkerProtocolError("invalid_transcript_artifacts")
+        if artifacts[0].length > min(max_output_bytes, TRANSCRIPT_MAX_BYTES):
+            raise MediaWorkerProtocolError("output_too_large")
+        return
     if len(artifacts) > 4:
         raise MediaWorkerProtocolError("too_many_artifacts")
     names = [item.name for item in artifacts]
@@ -594,12 +604,24 @@ class FFmpegMediaWorkerProcessor:
     def __init__(
         self,
         ffmpeg_binary: str | Path,
+        transcriber_binary: str | Path | None = None,
+        transcriber_model: str | Path | None = None,
         timeout_seconds: float = 120,
         *,
         max_output_bytes: int = MAX_OUTPUT_BYTES,
         _clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.ffmpeg_binary = Path(ffmpeg_binary).expanduser()
+        self.transcriber_binary = (
+            Path(transcriber_binary).expanduser()
+            if transcriber_binary is not None
+            else None
+        )
+        self.transcriber_model = (
+            Path(transcriber_model).expanduser()
+            if transcriber_model is not None
+            else None
+        )
         self.timeout_seconds = max(1.0, float(timeout_seconds))
         self.set_output_limit(max_output_bytes)
         self._clock = _clock
@@ -651,6 +673,129 @@ class FFmpegMediaWorkerProcessor:
             duration_seconds=duration_seconds,
             inputs=(LocalInput("localAudio", str(audio.resolve())),),
         )
+
+    def prepare_transcript(
+        self,
+        *,
+        media_key: str,
+        source_path: str | Path,
+        duration_seconds: int,
+        output_directory: str | Path,
+    ) -> PreparedMedia:
+        del media_key
+        if self.transcriber_binary is None or self.transcriber_model is None:
+            raise MediaProcessingError("transcriber_unavailable")
+        output = Path(output_directory)
+        wav = output / "speech.wav"
+        deadline = self._clock() + self.timeout_seconds
+        self._run(
+            [
+                "-i",
+                str(source_path),
+                "-vn",
+                "-ac",
+                "1",
+                "-ar",
+                "16000",
+                "-c:a",
+                "pcm_s16le",
+            ],
+            wav,
+            error_kind="invalid_audio",
+            input_format=_safe_ffmpeg_input_format(source_path, kind="voice"),
+            deadline=deadline,
+        )
+        transcript = output / "transcript.txt"
+        self._run_transcriber(
+            wav=wav,
+            transcript=transcript,
+            deadline=deadline,
+        )
+        return PreparedMedia(
+            kind="transcript",
+            duration_seconds=duration_seconds,
+            inputs=(),
+        )
+
+    def _run_transcriber(
+        self,
+        *,
+        wav: Path,
+        transcript: Path,
+        deadline: float,
+    ) -> None:
+        assert self.transcriber_binary is not None
+        assert self.transcriber_model is not None
+        try:
+            executable = _validate_executable(
+                self.transcriber_binary,
+                field="transcriber_binary",
+            )
+        except MediaWorkerConfigError:
+            raise MediaProcessingError("transcriber_unavailable") from None
+        remaining = deadline - self._clock()
+        if remaining <= 0:
+            raise MediaProcessingError("transcriber_unavailable")
+        output_base = transcript.with_suffix("")
+        process: subprocess.Popen[bytes] | None = None
+        try:
+            try:
+                process = subprocess.Popen(
+                    [
+                        str(executable),
+                        "-m",
+                        str(self.transcriber_model),
+                        "-f",
+                        str(wav),
+                        "-l",
+                        "ru",
+                        "-nt",
+                        "-t",
+                        "2",
+                        "-otxt",
+                        "-of",
+                        str(output_base),
+                    ],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+            except OSError:
+                raise MediaProcessingError("transcriber_unavailable") from None
+            while process.poll() is None:
+                process_id = getattr(process, "pid", None)
+                if isinstance(process_id, int) and process_id > 0:
+                    resident = _process_group_rss_bytes(process_id)
+                    if resident is not None and resident > FFMPEG_PROCESS_GROUP_RSS_LIMIT_BYTES:
+                        _kill_process_group(process)
+                        process.wait()
+                        raise MediaProcessingError("transcriber_unavailable")
+                remaining = deadline - self._clock()
+                if remaining <= 0:
+                    _kill_process_group(process)
+                    process.wait()
+                    raise MediaProcessingError("transcriber_unavailable")
+                try:
+                    process.wait(
+                        timeout=min(FFMPEG_MONITOR_INTERVAL_SECONDS, remaining)
+                    )
+                except subprocess.TimeoutExpired:
+                    continue
+            if process.returncode != 0:
+                raise MediaProcessingError("transcriber_unavailable")
+            status = _owner_regular_file(transcript)
+            if status.st_size > TRANSCRIPT_MAX_BYTES:
+                raise MediaProcessingError("transcriber_unavailable")
+            text = transcript.read_text(encoding="utf-8").strip()
+            if not text or "\x00" in text:
+                raise MediaProcessingError("transcriber_unavailable")
+            transcript.write_text(text + "\n", encoding="utf-8")
+            os.chmod(transcript, 0o600)
+        finally:
+            if process is not None and process.poll() is None:
+                _kill_process_group(process)
+                with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+                    process.wait(timeout=1)
 
     def prepare_video(
         self,
@@ -1757,6 +1902,8 @@ class MediaWorkerServer:
         prepared: PreparedMedia,
         work_directory: Path,
     ) -> tuple[_Artifact, ...]:
+        if request.kind == "transcript":
+            return self._publish_transcript(request, prepared, work_directory)
         if (
             prepared.kind != request.kind
             or prepared.duration_seconds != request.duration_seconds
@@ -1862,6 +2009,68 @@ class MediaWorkerServer:
             os.rename(publish_directory, output_directory)
             _fsync_directory(output_directory.parent)
             return tuple(artifacts)
+        finally:
+            if publish_directory.exists():
+                shutil.rmtree(publish_directory, ignore_errors=True)
+
+    def _publish_transcript(
+        self,
+        request: _JobRequest,
+        prepared: PreparedMedia,
+        work_directory: Path,
+    ) -> tuple[_Artifact, ...]:
+        if (
+            prepared.kind != request.kind
+            or prepared.duration_seconds != request.duration_seconds
+            or prepared.inputs
+        ):
+            raise MediaProcessingError("invalid_worker_output")
+        source = work_directory / "transcript.txt"
+        status = _owner_regular_file(source)
+        if status.st_size > TRANSCRIPT_MAX_BYTES:
+            raise MediaProcessingError("invalid_worker_output")
+        try:
+            text = source.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            raise MediaProcessingError("invalid_worker_output") from None
+        if not text.strip() or "\x00" in text:
+            raise MediaProcessingError("invalid_worker_output")
+        length, digest = self._hash_owned_artifact(source)
+        artifact = _Artifact(
+            name="transcript.txt",
+            content_type="text/plain; charset=utf-8",
+            length=length,
+            sha256=digest,
+        )
+        _validate_artifact_set(
+            (artifact,),
+            kind=request.kind,
+            max_output_bytes=self.max_output_bytes,
+        )
+        publish_directory = self._job_directory(request.job_id) / (
+            f".publish-{request.job_id}-{uuid.uuid4().hex}.part"
+        )
+        output_directory = self._job_directory(request.job_id) / "output"
+        publish_directory.mkdir(mode=0o700)
+        try:
+            destination = publish_directory / artifact.name
+            os.replace(source, destination)
+            os.chmod(destination, 0o600)
+            with destination.open("rb") as stream:
+                os.fsync(stream.fileno())
+            _write_json_atomic(
+                publish_directory / "result.json",
+                {
+                    "version": PROTOCOL_VERSION,
+                    "kind": request.kind,
+                    "duration_seconds": request.duration_seconds,
+                    "artifacts": [artifact.to_dict()],
+                },
+            )
+            _fsync_directory(publish_directory)
+            os.rename(publish_directory, output_directory)
+            _fsync_directory(output_directory.parent)
+            return (artifact,)
         finally:
             if publish_directory.exists():
                 shutil.rmtree(publish_directory, ignore_errors=True)
@@ -2729,7 +2938,7 @@ class MediaWorkerClient:
         directory: Path,
         deadline: float,
     ) -> None:
-        if artifact.name == "audio.mp3":
+        if artifact.name in {"audio.mp3", "transcript.txt"}:
             pass
         elif FRAME_NAME_PATTERN.fullmatch(artifact.name) is None:
             raise MediaWorkerProtocolError("unsafe_artifact_name")
@@ -2834,6 +3043,8 @@ class MediaWorkerClient:
             length, digest = self._hash_local_artifact(path)
             if length != artifact.length or digest != artifact.sha256:
                 raise MediaWorkerProtocolError("artifact_digest_mismatch")
+            if artifact.name == "transcript.txt":
+                continue
             if artifact.name == "audio.mp3":
                 inputs.append(LocalInput("localAudio", str(path.resolve())))
             else:
@@ -2845,6 +3056,43 @@ class MediaWorkerClient:
             duration_seconds=request.duration_seconds,
             inputs=tuple(inputs),
         )
+
+    def transcribe(
+        self,
+        *,
+        media_key: str,
+        source_path: str | Path,
+        duration_seconds: int,
+        destination_directory: str | Path,
+    ) -> str:
+        source = Path(source_path)
+        length, digest = _sha256_file(source, maximum=self.max_source_bytes)
+        job_id = _canonical_job_id(
+            kind="transcript",
+            media_key=media_key,
+            duration_seconds=duration_seconds,
+            source_length=length,
+            source_sha256=digest,
+        )
+        self.prepare(
+            kind="transcript",
+            media_key=media_key,
+            source_path=source,
+            duration_seconds=duration_seconds,
+            destination_directory=destination_directory,
+        )
+        directory = self._validate_destination(destination_directory) / f"worker-{job_id}"
+        path = directory / "transcript.txt"
+        status = _owner_regular_file(path)
+        if status.st_size > TRANSCRIPT_MAX_BYTES:
+            raise MediaWorkerProtocolError("output_too_large")
+        try:
+            transcript = path.read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeError):
+            raise MediaWorkerProtocolError("malformed_transcript") from None
+        if not transcript or "\x00" in transcript:
+            raise MediaWorkerProtocolError("malformed_transcript")
+        return transcript
 
     def _validate_destination(self, value: str | Path) -> Path:
         path = Path(value).expanduser()

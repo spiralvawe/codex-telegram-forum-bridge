@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Add an opt-in, bounded remote speech-recognition job to the existing mTLS
+  media worker. The Pi sends only the voice media to its already trusted
+  worker, receives a UTF-8 transcript, and never starts local Whisper when a
+  remote recognizer is configured. The worker accepts only a root-owned
+  whisper.cpp-compatible executable and root-owned model, converts media with
+  its existing constrained FFmpeg path, uses two recognizer threads, and kills
+  an over-limit or timed-out process group. A temporary remote failure returns
+  a clear Telegram retry message instead of passing audio that Codex cannot
+  transcribe or risking Pi memory pressure.
+
 - Keep Telegram responsive on small Linux hosts during voice requests: local
   STT is now skipped, with native-audio fallback retained, while any Codex
   turn is active or available memory is below a conservative 450 MiB floor.

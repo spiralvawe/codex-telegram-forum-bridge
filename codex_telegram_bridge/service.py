@@ -102,6 +102,7 @@ FALLBACK_PROGRESS_INPUT_LIMIT = 3_700
 PROGRESS_DETAILS_TITLE = "Ход работы Codex"
 PROGRESS_HEARTBEAT_CHECK_SECONDS = 5.0
 PROGRESS_COLLAPSE_RESET_SECONDS = 0.35
+LOCAL_STT_DEFAULT_MIN_AVAILABLE_MEMORY_MIB = 450
 FINAL_ANSWER_CUSTOM_EMOJI_SETTING = (
     "telegram_final_answer_custom_emoji_id"
 )
@@ -2072,6 +2073,13 @@ class BridgeService:
         command = os.environ.get("CODEX_TELEGRAM_LOCAL_STT_COMMAND", "").strip()
         if not command or prepared.kind != "voice":
             return None
+        admission_reason = self._local_stt_admission_reason()
+        if admission_reason is not None:
+            # Native audio remains a fully supported input. Skipping an
+            # optional transcript is preferable to competing with a live
+            # Codex turn for the last memory on a small bridge host.
+            LOGGER.info("Local STT skipped; reason=%s", admission_reason)
+            return None
         audio = next(
             (item.path for item in prepared.inputs if item.kind == "localAudio"),
             None,
@@ -2116,6 +2124,57 @@ class BridgeService:
             return None
         transcript = stdout.decode("utf-8", errors="replace").strip()
         return transcript[:8_000] or None
+
+    def _local_stt_admission_reason(self) -> str | None:
+        """Return a local-only reason to preserve native-audio fallback.
+
+        Local speech recognition is optional and can transiently consume a
+        large fraction of a small host. It must never start alongside any
+        active Codex work, and Linux hosts must retain a conservative amount
+        of immediately available memory before it is admitted.
+        """
+
+        if self.busy_threads or self.active_turns:
+            return "active_turn"
+        available_memory = self._linux_available_memory_bytes()
+        if available_memory is None:
+            return None
+        minimum_memory = self._local_stt_min_available_memory_bytes()
+        if available_memory < minimum_memory:
+            return "low_memory"
+        return None
+
+    @staticmethod
+    def _local_stt_min_available_memory_bytes() -> int:
+        raw = os.environ.get(
+            "CODEX_TELEGRAM_LOCAL_STT_MIN_AVAILABLE_MEMORY_MIB",
+            str(LOCAL_STT_DEFAULT_MIN_AVAILABLE_MEMORY_MIB),
+        )
+        try:
+            memory_mib = int(raw)
+        except ValueError:
+            memory_mib = LOCAL_STT_DEFAULT_MIN_AVAILABLE_MEMORY_MIB
+        return max(0, memory_mib) * 1024 * 1024
+
+    @staticmethod
+    def _linux_available_memory_bytes() -> int | None:
+        """Read Linux MemAvailable without importing an optional dependency."""
+
+        try:
+            for line in Path("/proc/meminfo").read_text(
+                encoding="ascii",
+                errors="strict",
+            ).splitlines():
+                fields = line.split()
+                if (
+                    len(fields) == 3
+                    and fields[0] == "MemAvailable:"
+                    and fields[2] == "kB"
+                ):
+                    return max(0, int(fields[1])) * 1024
+        except (OSError, UnicodeError, ValueError):
+            return None
+        return None
 
     async def _prepare_telegram_media(
         self,

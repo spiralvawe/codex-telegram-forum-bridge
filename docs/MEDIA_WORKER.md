@@ -57,7 +57,8 @@ installation remains a separate reviewed action.
 ## Worker configuration
 
 The worker configuration is a `0600` JSON file owned by the dedicated worker
-account. Every field is required and the schema is closed:
+account. The schema is closed. The transcriber fields are optional as a pair;
+all other fields are required:
 
 ```json
 {
@@ -74,6 +75,20 @@ account. Every field is required and the schema is closed:
   "processing_timeout_seconds": 120,
   "shutdown_timeout_seconds": 20,
   "retention_seconds": 86400
+}
+```
+
+To enable speech recognition, add both fields below. The executable must be a
+root-owned non-writable regular file and the model must be a root-owned,
+non-writable readable regular file, both outside user and credential paths.
+The executable follows the whisper.cpp CLI contract (`-m`, `-f`, `-l`, `-t`,
+`-otxt`, `-of`); no model name, shell, or arbitrary argument ever crosses the
+Pi/worker boundary.
+
+```json
+{
+  "transcriber_binary": "/usr/local/libexec/whisper-cli",
+  "transcriber_model": "/Library/Application Support/CodexTelegramMediaWorker/models/ggml-base.bin"
 }
 ```
 
@@ -100,7 +115,9 @@ single-allocation ceiling, and one decoder, encoder, and filter thread. On
 macOS a public `libproc` watchdog polls the complete FFmpeg process group's
 physical footprint and kills it above 512 MiB; failure to monitor a live job
 also fails closed. A memory-budget result is terminal and is not repeated on
-the Pi.
+the Pi. Speech recognition first makes a 16 kHz mono WAV through that same
+FFmpeg boundary, runs at two fixed threads, emits one UTF-8 `transcript.txt`
+artifact up to 64 KiB, and has the same timeout and process-group watchdog.
 
 Linux `MemoryMax` is a strict service-cgroup cap. macOS
 `ResidentSetSize`/`RLIMIT_RSS` is only a memory-pressure hint, so the libproc

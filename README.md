@@ -261,6 +261,16 @@ Telegram voice and video with FFmpeg. The worker is only an accelerator:
 - an authenticated terminal invalid-media result is returned directly and is
   intentionally not processed a second time on the resource-limited host.
 
+When the worker configuration additionally contains both
+`transcriber_binary` and `transcriber_model`, it can also turn a voice message
+into text. Both paths must be root-owned, outside credential directories, and
+not group- or world-writable. The recognizer follows the whisper.cpp CLI
+contract, receives a worker-created 16 kHz mono WAV rather than arbitrary
+arguments, is limited to two threads, 64 KiB of UTF-8 output, the configured
+worker timeout, and the same 512 MiB process-group watchdog. On the Pi, a
+remote-recognizer failure is reported in Telegram as retryable; it never
+falls back to Pi Whisper or to an audio attachment that Codex cannot decode.
+
 The optional worker is never a systemd dependency and is not part of bridge
 readiness or the local watchdog. Removing its configuration restores the exact
 local-only behavior.

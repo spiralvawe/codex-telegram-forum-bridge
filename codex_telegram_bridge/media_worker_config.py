@@ -17,6 +17,8 @@ WORKER_CONFIG_FIELDS = frozenset(
         "listen_port",
         "state_dir",
         "ffmpeg_binary",
+        "transcriber_binary",
+        "transcriber_model",
         "tls_server_cert",
         "tls_server_key",
         "tls_client_ca",
@@ -75,6 +77,8 @@ class MediaWorkerConfig:
     listen_port: int
     state_dir: Path
     ffmpeg_binary: Path
+    transcriber_binary: Path | None
+    transcriber_model: Path | None
     tls_server_cert: Path
     tls_server_key: Path
     tls_client_ca: Path
@@ -112,7 +116,11 @@ class MediaWorkerConfig:
             raise MediaWorkerConfigError(
                 "configuration contains a forbidden integration field"
             )
-        missing = WORKER_CONFIG_FIELDS - supplied_fields
+        required_fields = WORKER_CONFIG_FIELDS - {
+            "transcriber_binary",
+            "transcriber_model",
+        }
+        missing = required_fields - supplied_fields
         unknown = supplied_fields - WORKER_CONFIG_FIELDS
         if missing:
             raise MediaWorkerConfigError(
@@ -137,6 +145,37 @@ class MediaWorkerConfig:
         ffmpeg_binary = _absolute_path(
             _string(payload["ffmpeg_binary"], field="ffmpeg_binary"),
             field="ffmpeg_binary",
+        )
+        transcriber_fields = {
+            "transcriber_binary",
+            "transcriber_model",
+        }
+        configured_transcriber_fields = supplied_fields & transcriber_fields
+        if configured_transcriber_fields not in (set(), transcriber_fields):
+            raise MediaWorkerConfigError(
+                "transcriber binary and model must be configured together"
+            )
+        transcriber_binary = (
+            _absolute_path(
+                _string(
+                    payload["transcriber_binary"],
+                    field="transcriber_binary",
+                ),
+                field="transcriber_binary",
+            )
+            if configured_transcriber_fields
+            else None
+        )
+        transcriber_model = (
+            _absolute_path(
+                _string(
+                    payload["transcriber_model"],
+                    field="transcriber_model",
+                ),
+                field="transcriber_model",
+            )
+            if configured_transcriber_fields
+            else None
         )
         tls_server_cert = _absolute_path(
             _string(
@@ -165,6 +204,9 @@ class MediaWorkerConfig:
             ("tls_client_ca", tls_client_ca),
         ):
             _reject_sensitive_location(path, field=field)
+        if transcriber_binary is not None and transcriber_model is not None:
+            _reject_sensitive_location(transcriber_binary, field="transcriber_binary")
+            _reject_sensitive_location(transcriber_model, field="transcriber_model")
 
         state_dir = _validate_private_directory(
             state_dir,
@@ -174,6 +216,15 @@ class MediaWorkerConfig:
             ffmpeg_binary,
             field="ffmpeg_binary",
         )
+        if transcriber_binary is not None and transcriber_model is not None:
+            transcriber_binary = _validate_executable(
+                transcriber_binary,
+                field="transcriber_binary",
+            )
+            transcriber_model = _validate_root_owned_file(
+                transcriber_model,
+                field="transcriber_model",
+            )
         tls_server_cert = _validate_owner_only_file(
             tls_server_cert,
             field="tls_server_cert",
@@ -261,6 +312,8 @@ class MediaWorkerConfig:
             listen_port=listen_port,
             state_dir=state_dir,
             ffmpeg_binary=ffmpeg_binary,
+            transcriber_binary=transcriber_binary,
+            transcriber_model=transcriber_model,
             tls_server_cert=tls_server_cert,
             tls_server_key=tls_server_key,
             tls_client_ca=tls_client_ca,
@@ -518,6 +571,26 @@ def _validate_executable(path: Path, *, field: str) -> Path:
         )
     if not os.access(path, os.X_OK):
         raise MediaWorkerConfigError(f"{field} must be executable")
+    return path.resolve(strict=True)
+
+
+def _validate_root_owned_file(path: Path, *, field: str) -> Path:
+    _validate_protected_ancestors(
+        path,
+        field=field,
+        allow_worker_owned=False,
+    )
+    metadata = _safe_lstat(path, field=field)
+    if not stat.S_ISREG(metadata.st_mode):
+        raise MediaWorkerConfigError(f"{field} must be a regular file")
+    if metadata.st_uid != 0:
+        raise MediaWorkerConfigError(f"{field} must be owned by root")
+    if metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise MediaWorkerConfigError(
+            f"{field} must not be group- or world-writable"
+        )
+    if not os.access(path, os.R_OK):
+        raise MediaWorkerConfigError(f"{field} must be readable")
     return path.resolve(strict=True)
 
 

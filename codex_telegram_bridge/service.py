@@ -2125,6 +2125,42 @@ class BridgeService:
         transcript = stdout.decode("utf-8", errors="replace").strip()
         return transcript[:8_000] or None
 
+    async def _remote_stt_transcript(
+        self,
+        *,
+        media_key: str,
+        source_path: Path,
+        duration_seconds: int,
+    ) -> str | None:
+        """Use the optional isolated worker without ever loading STT on Pi."""
+
+        worker = self.media_worker
+        transcribe = getattr(worker, "transcribe", None)
+        if not callable(transcribe):
+            return None
+        try:
+            transcript = await asyncio.to_thread(
+                transcribe,
+                media_key=media_key,
+                source_path=source_path,
+                duration_seconds=duration_seconds,
+                destination_directory=self.media.message_directory(media_key),
+            )
+        except Exception as error:
+            # The worker client already uses deterministic job IDs, bounded
+            # retries, mTLS, and a circuit breaker.  Its failure must remain
+            # isolated from the Telegram process and must not cause a local
+            # Whisper process to contend for Pi memory as a fallback.
+            LOGGER.warning(
+                "Remote STT unavailable; reason=%s",
+                type(error).__name__,
+            )
+            return None
+        if not isinstance(transcript, str):
+            return None
+        sanitized = transcript.replace("\x00", "").strip()
+        return sanitized[:8_000] or None
+
     def _local_stt_admission_reason(self) -> str | None:
         """Return a local-only reason to preserve native-audio fallback.
 
@@ -2282,7 +2318,22 @@ class BridgeService:
                 duration_seconds=duration,
             )
         if kind != "document":
-            transcript = await self._local_stt_transcript(prepared)
+            transcript = None
+            if kind == "voice":
+                transcript = await self._remote_stt_transcript(
+                    media_key=media_key,
+                    source_path=source,
+                    duration_seconds=duration,
+                )
+                if transcript is None and callable(
+                    getattr(self.media_worker, "transcribe", None)
+                ):
+                    # A configured remote worker is authoritative for voice
+                    # recognition.  Do not fall back to native audio (which
+                    # Codex cannot transcribe) or to RAM-heavy local STT.
+                    raise MediaProcessingError("transcription_unavailable")
+            if transcript is None:
+                transcript = await self._local_stt_transcript(prepared)
             if transcript is not None:
                 prepared_text = (
                     f"{user_text.strip()}\n\n" if user_text.strip() else ""
@@ -2309,6 +2360,12 @@ class BridgeService:
             text = (
                 "Файл больше 20 МБ — облачный Telegram Bot API не позволяет "
                 "боту скачать его. Отправьте файл меньшего размера."
+            )
+        elif error.kind == "transcription_unavailable":
+            text = (
+                "Расшифровка голосового сообщения сейчас недоступна. "
+                "Сообщение не передано в Codex как бесполезный аудиофайл; "
+                "отправьте его повторно через минуту или напишите текстом."
             )
         elif error.kind == "ffmpeg_unavailable":
             text = (

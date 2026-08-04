@@ -151,6 +151,12 @@ class MediaWorkerConfigTests(unittest.TestCase):
                 with self.assertRaises(MediaWorkerConfigError):
                     MediaWorkerConfig.from_mapping(payload)
 
+    def test_transcriber_requires_binary_and_model_together(self) -> None:
+        payload = dict(self.fixture.payload)
+        payload["transcriber_binary"] = "/usr/bin/true"
+        with self.assertRaises(MediaWorkerConfigError):
+            MediaWorkerConfig.from_mapping(payload)
+
     def test_runtime_paths_reject_symlinks_and_bridge_state(self) -> None:
         actual_key = self.fixture.server_key
         linked_key = self.fixture.tls_dir / "linked.key"

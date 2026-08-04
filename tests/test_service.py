@@ -25,6 +25,7 @@ from codex_telegram_bridge.codex import (  # noqa: E402
 from codex_telegram_bridge.config import BridgeConfig  # noqa: E402
 from codex_telegram_bridge.input_types import LocalInput  # noqa: E402
 from codex_telegram_bridge.media import (  # noqa: E402
+    MediaProcessingError,
     MediaPruneResult,
     PreparedMedia,
 )
@@ -1186,6 +1187,60 @@ class ServiceRoutingTests(unittest.IsolatedAsyncioTestCase):
             "срочно\n\n🎙 Расшифровка голосового сообщения:\n"
             "проверить бойлер",
         )
+
+    async def test_remote_stt_replaces_voice_without_starting_local_stt(
+        self,
+    ) -> None:
+        audio = self.local_media_input(name="normalized.mp3")
+        self.service.media_worker = SimpleNamespace(
+            transcribe=Mock(return_value="проверить бойлер"),
+        )
+        self.service._local_stt_transcript = AsyncMock(  # type: ignore[method-assign]
+            return_value="local fallback must not run",
+        )
+        self.service.media.prepare_voice = Mock(  # type: ignore[method-assign]
+            return_value=PreparedMedia(
+                kind="voice",
+                duration_seconds=7,
+                inputs=(audio,),
+            )
+        )
+
+        text, inputs = await self.service._prepare_telegram_media(
+            self.topic_media_message("voice")["message"],
+            client_id="tg:-100500:90",
+            user_text="срочно",
+        )
+
+        self.service.media_worker.transcribe.assert_called_once()
+        self.service._local_stt_transcript.assert_not_awaited()
+        self.assertEqual(inputs, ())
+        self.assertIn("проверить бойлер", text)
+
+    async def test_configured_remote_stt_does_not_fallback_to_audio(
+        self,
+    ) -> None:
+        audio = self.local_media_input(name="normalized.mp3")
+        self.service.media_worker = SimpleNamespace(
+            transcribe=Mock(side_effect=RuntimeError("offline")),
+        )
+        self.service.media.prepare_voice = Mock(  # type: ignore[method-assign]
+            return_value=PreparedMedia(
+                kind="voice",
+                duration_seconds=7,
+                inputs=(audio,),
+            )
+        )
+
+        with self.assertRaisesRegex(
+            MediaProcessingError,
+            "transcription_unavailable",
+        ):
+            await self.service._prepare_telegram_media(
+                self.topic_media_message("voice")["message"],
+                client_id="tg:-100500:90",
+                user_text="",
+            )
 
     async def test_local_stt_is_not_admitted_while_a_turn_is_active(
         self,

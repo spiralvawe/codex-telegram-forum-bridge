@@ -50,6 +50,23 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(binding.allowed_user_id, 42)
         self.assertEqual(binding.bot_username, "example_bot")
 
+    def test_quarantined_update_is_processed_and_recorded(self) -> None:
+        self.store.quarantine_telegram_update(
+            100,
+            update_kind="message",
+            error_type="AttributeError",
+        )
+
+        self.assertTrue(self.store.telegram_update_processed(100))
+        self.assertEqual(
+            self.store.telegram_update_quarantine_health(),
+            {"quarantined": 1},
+        )
+        row = self.store.connection.execute(
+            "SELECT update_kind, error_type FROM telegram_update_quarantine"
+        ).fetchone()
+        self.assertEqual(tuple(row), ("message", "AttributeError"))
+
     def test_topic_mapping_is_bidirectional(self) -> None:
         self.store.upsert_topic(
             thread_id="thread-1",

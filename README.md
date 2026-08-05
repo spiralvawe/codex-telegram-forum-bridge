@@ -190,7 +190,8 @@ hidden prompt into an owner-only regular file outside the repository.
 - Codex CLI/App Server version equality and explicit compatibility;
 - local socket ownership and protocol smoke;
 - SQLite integrity, schema, queue age, unresolved delivery outcomes, and
-  exact task↔Topic parity;
+  exact task↔Topic parity, plus a content-free count of quarantined malformed
+  inbound updates;
 - ffmpeg and private media storage.
 - the owner-only deployment manifest and deterministic installed-package
   digest, so direct runtime edits or incomplete installs fail closed.
@@ -212,6 +213,10 @@ unexpected exit of any critical internal loop terminates the process so the
 service manager can restart the whole bridge instead of leaving a
 half-working PID. Both systemd and launchd restart the bridge after any
 unintended exit. Repeated long-poll failures trigger a short recovery poll.
+Malformed Bot API response shapes are classified as retryable protocol
+failures. An unexpected exception while handling one structurally valid update
+is recorded without its content and that update is durably quarantined, so it
+cannot pin the global polling cursor or block later Telegram messages.
 On Linux, a stale repeated local polling fault suppresses watchdog heartbeats
 so systemd replaces the half-working process. Classified external network
 outages keep the process alive and retrying instead of causing restart loops.

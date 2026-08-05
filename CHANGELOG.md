@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Prevent one malformed or newly unsupported Telegram update from pinning the
+  global polling cursor. Unexpected per-update failures are now durably
+  quarantined without storing message content, then the cursor advances while
+  Telegram transport/API failures remain retryable. Expose a sanitized
+  quarantine count through `doctor`.
+- Validate Telegram response and `getUpdates` result shapes before accessing
+  fields, classifying malformed remote JSON values as retryable protocol
+  errors instead of leaking local `AttributeError`/`TypeError` failures.
+
 - Add an opt-in, bounded remote speech-recognition job to the existing mTLS
   media worker. The Pi sends only the voice media to its already trusted
   worker, receives a UTF-8 transcript, and never starts local Whisper when a

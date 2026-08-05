@@ -351,6 +351,7 @@ def doctor_database_health(store: BridgeStore) -> dict[str, Any]:
         "queue": queue,
         "queueHealthy": queue_health_is_acceptable(queue),
         "deliveryUncertainty": store.delivery_uncertainty_health(),
+        "telegramUpdateQuarantine": store.telegram_update_quarantine_health(),
         "unresolvedTopicCreations": len(
             store.unresolved_topic_creations()
         ),

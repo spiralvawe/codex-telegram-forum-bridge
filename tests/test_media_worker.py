@@ -106,6 +106,27 @@ class _FakeProcessor:
         )
 
 
+class _TranscriptProcessor(_FakeProcessor):
+    def prepare_transcript(
+        self,
+        *,
+        media_key: str,
+        source_path: str | Path,
+        duration_seconds: int,
+        output_directory: str | Path,
+    ) -> PreparedMedia:
+        del media_key, source_path
+        self.calls += 1
+        transcript = Path(output_directory) / "transcript.txt"
+        transcript.write_text("проверка распознавания\n", encoding="utf-8")
+        os.chmod(transcript, 0o600)
+        return PreparedMedia(
+            kind="transcript",
+            duration_seconds=duration_seconds,
+            inputs=(),
+        )
+
+
 class _FailingProcessor(_FakeProcessor):
     def __init__(self, kind: str) -> None:
         super().__init__()
@@ -1363,6 +1384,20 @@ class MutualTLSIntegrationTests(unittest.TestCase):
                 for item in self.destination.iterdir()
             )
         )
+
+    def test_mtls_transcript_downloads_the_text_artifact(self) -> None:
+        processor = _TranscriptProcessor()
+        server = self._start_server(processor)
+
+        transcript = self._client(server).transcribe(
+            media_key="e" * 32,
+            source_path=self.source,
+            duration_seconds=2,
+            destination_directory=self.destination,
+        )
+
+        self.assertEqual(transcript, "проверка распознавания")
+        self.assertEqual(processor.calls, 1)
 
     def test_server_requires_a_client_certificate(self) -> None:
         server = self._start_server(_FakeProcessor())

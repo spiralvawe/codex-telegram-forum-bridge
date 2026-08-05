@@ -2986,9 +2986,22 @@ class ServiceRoutingTests(unittest.IsolatedAsyncioTestCase):
             await original_handler(update)
 
         self.service.handle_telegram_update = handle  # type: ignore[method-assign]
-        self.service._tg = AsyncMock(
-            side_effect=[[broken, healthy], asyncio.CancelledError()]
-        )
+        polls = 0
+
+        async def telegram(method: str, **_kwargs: Any) -> Any:
+            nonlocal polls
+            if method != "get_updates":
+                return {}
+            polls += 1
+            if polls == 1:
+                return [broken, healthy]
+            raise asyncio.CancelledError()
+
+        # The healthy update sends its own Telegram acknowledgement while it
+        # is queued.  Keep that call separate from the next long-poll so the
+        # test exercises the cursor recovery rather than cancelling midway
+        # through the healthy handler.
+        self.service._tg = AsyncMock(side_effect=telegram)
 
         with self.assertRaises(asyncio.CancelledError):
             await self.service.telegram_loop()

@@ -1084,6 +1084,20 @@ def loop_error_kind(error: BaseException) -> str:
     return "unexpected"
 
 
+def telegram_update_kind(update: dict[str, Any]) -> str:
+    """Return a content-free update category for operational diagnostics."""
+
+    for key in (
+        "message",
+        "edited_message",
+        "callback_query",
+        "my_chat_member",
+    ):
+        if key in update:
+            return key
+    return "unknown"
+
+
 def approval_keyboard(
     public_id: str,
     *,
@@ -1897,8 +1911,34 @@ class BridgeService:
                 for update in updates:
                     update_id = int(update["update_id"])
                     if not self.store.telegram_update_processed(update_id):
-                        await self.handle_telegram_update(update)
-                        self.store.mark_telegram_update_processed(update_id)
+                        try:
+                            await self.handle_telegram_update(update)
+                        except asyncio.CancelledError:
+                            raise
+                        except TelegramError:
+                            # A Telegram transport/API error is retryable.
+                            # Do not acknowledge its update until the remote
+                            # side is reachable again.
+                            raise
+                        except Exception as error:
+                            # One malformed or newly unsupported update must
+                            # never pin the global getUpdates cursor. Record
+                            # only structural metadata; no message/media
+                            # content or opaque identifiers enter the logs.
+                            update_kind = telegram_update_kind(update)
+                            self.store.quarantine_telegram_update(
+                                update_id,
+                                update_kind=update_kind,
+                                error_type=type(error).__name__,
+                            )
+                            LOGGER.error(
+                                "Telegram update quarantined; kind=%s; "
+                                "error_type=%s",
+                                update_kind,
+                                type(error).__name__,
+                            )
+                        else:
+                            self.store.mark_telegram_update_processed(update_id)
                     offset = update_id + 1
                     self.store.set_telegram_offset(offset)
             except asyncio.CancelledError:

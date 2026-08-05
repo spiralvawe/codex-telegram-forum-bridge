@@ -2971,6 +2971,75 @@ class ServiceRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(timeouts[:4], [25, 25, 25, 0])
         self.assertEqual(self.service.telegram_update_health.consecutive_failures, 0)
 
+    async def test_telegram_loop_quarantines_unexpected_update_and_continues(
+        self,
+    ) -> None:
+        broken = self.topic_message("сломанный", message_id=91)
+        broken["update_id"] = 11
+        healthy = self.topic_message("обработай", message_id=92)
+        healthy["update_id"] = 12
+        original_handler = self.service.handle_telegram_update
+
+        async def handle(update: dict[str, Any]) -> None:
+            if update["update_id"] == 11:
+                raise AttributeError("unexpected update shape")
+            await original_handler(update)
+
+        self.service.handle_telegram_update = handle  # type: ignore[method-assign]
+        polls = 0
+
+        async def telegram(method: str, **_kwargs: Any) -> Any:
+            nonlocal polls
+            if method != "get_updates":
+                return {}
+            polls += 1
+            if polls == 1:
+                return [broken, healthy]
+            raise asyncio.CancelledError()
+
+        # The healthy update sends its own Telegram acknowledgement while it
+        # is queued.  Keep that call separate from the next long-poll so the
+        # test exercises the cursor recovery rather than cancelling midway
+        # through the healthy handler.
+        self.service._tg = AsyncMock(side_effect=telegram)
+
+        with self.assertRaises(asyncio.CancelledError):
+            await self.service.telegram_loop()
+
+        self.assertTrue(self.store.telegram_update_processed(11))
+        self.assertTrue(self.store.telegram_update_processed(12))
+        self.assertEqual(self.store.telegram_offset(), 13)
+        self.assertEqual(
+            self.store.telegram_update_quarantine_health(),
+            {"quarantined": 1},
+        )
+        self.assertEqual(self.service.telegram_update_health.consecutive_failures, 0)
+
+    async def test_telegram_loop_retries_telegram_error_without_quarantine(
+        self,
+    ) -> None:
+        update = self.topic_message("повтори", message_id=91)
+        update["update_id"] = 11
+        self.service.handle_telegram_update = AsyncMock(  # type: ignore[method-assign]
+            side_effect=TelegramError("offline", kind="network_error")
+        )
+        self.service._tg = AsyncMock(
+            side_effect=[[update], asyncio.CancelledError()]
+        )
+
+        with patch(
+            "codex_telegram_bridge.service.asyncio.sleep",
+            new=AsyncMock(),
+        ):
+            with self.assertRaises(asyncio.CancelledError):
+                await self.service.telegram_loop()
+
+        self.assertFalse(self.store.telegram_update_processed(11))
+        self.assertEqual(
+            self.store.telegram_update_quarantine_health(),
+            {"quarantined": 0},
+        )
+
     def test_watchdog_rejects_only_stale_repeated_local_fault(self) -> None:
         self.service.telegram_update_health.record_failure("network_error")
         self.service.telegram_update_health.consecutive_failures = 4

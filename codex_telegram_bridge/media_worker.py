@@ -1560,7 +1560,7 @@ class MediaWorkerServer:
             return
 
         artifact_match = re.fullmatch(
-            r"/v1/jobs/([0-9a-f]{64})/artifacts/(audio\.mp3|frame-0[1-3]\.jpg)",
+            r"/v1/jobs/([0-9a-f]{64})/artifacts/(audio\.mp3|transcript\.txt|frame-0[1-3]\.jpg)",
             handler.path,
         )
         if artifact_match is None:

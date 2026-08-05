@@ -24,6 +24,8 @@ SQLite records:
 - Codex task ↔ Telegram Topic mappings;
 - queued Telegram input and local voice/video/document references;
 - inbound update completion;
+- a bounded content-free quarantine record for an unexpected per-update
+  handler failure, after which polling advances to later updates;
 - outbound message/media delivery reservations;
 - Topic-creation intents;
 - approval cards and decisions;

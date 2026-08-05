@@ -541,6 +541,36 @@ class TelegramErrorTests(unittest.TestCase):
         self.assertEqual(read_error.exception.kind, "protocol")
         self.assertFalse(read_error.exception.outcome_ambiguous)
 
+    def test_non_object_success_response_is_protocol_error(self) -> None:
+        response = Mock()
+        response.__enter__ = Mock(return_value=response)
+        response.__exit__ = Mock(return_value=False)
+        response.read.return_value = b"null"
+
+        with (
+            patch(
+                "codex_telegram_bridge.telegram.urllib.request.urlopen",
+                return_value=response,
+            ),
+            self.assertRaises(TelegramError) as raised,
+        ):
+            self.telegram.call("getUpdates", {})
+
+        self.assertEqual(raised.exception.kind, "protocol")
+        self.assertTrue(raised.exception.retryable)
+        self.assertFalse(raised.exception.outcome_ambiguous)
+
+    def test_get_updates_rejects_non_list_and_malformed_update(self) -> None:
+        self.telegram.call = Mock(side_effect=[{}, [{"update_id": "bad"}]])
+
+        with self.assertRaises(TelegramError) as non_list:
+            self.telegram.get_updates(offset=None, timeout=0)
+        with self.assertRaises(TelegramError) as bad_update:
+            self.telegram.get_updates(offset=None, timeout=0)
+
+        self.assertEqual(non_list.exception.kind, "protocol")
+        self.assertEqual(bad_update.exception.kind, "protocol")
+
     def test_malformed_multipart_success_is_ambiguous_protocol_error(
         self,
     ) -> None:

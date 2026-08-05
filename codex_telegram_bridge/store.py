@@ -17,7 +17,7 @@ from typing import Any
 from .input_types import LocalInput, normalize_local_inputs
 
 
-CURRENT_SCHEMA_VERSION = 5
+CURRENT_SCHEMA_VERSION = 6
 MIGRATION_BACKUP_RETENTION = 5
 MIGRATION_BACKUP_PREFIX = "bridge-schema-"
 OPERATIONAL_BACKUP_RETENTION = 7
@@ -360,6 +360,8 @@ class BridgeStore:
                     self._migrate_schema_v4(connection)
                 elif target_version == 5:
                     self._migrate_schema_v5(connection)
+                elif target_version == 6:
+                    self._migrate_schema_v6(connection)
                 else:
                     raise SchemaVersionError(
                         f"no migration is registered for schema {target_version}"
@@ -563,6 +565,7 @@ class BridgeStore:
                     CHECK (presentation IN ('legacy_index', 'card'))
                 """
             )
+
         if "summary" not in archive_columns:
             connection.execute(
                 """
@@ -591,6 +594,24 @@ class BridgeStore:
                 ADD COLUMN archive_message_id INTEGER
                 """
             )
+
+    def _migrate_schema_v6(self, connection: sqlite3.Connection) -> None:
+        """Persist a bounded, content-free record of skipped bad updates."""
+
+        _execute_sql_script(
+            connection,
+            """
+            CREATE TABLE IF NOT EXISTS telegram_update_quarantine (
+                update_id INTEGER PRIMARY KEY,
+                update_kind TEXT NOT NULL,
+                error_type TEXT NOT NULL,
+                quarantined_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS telegram_update_quarantine_recent
+                ON telegram_update_quarantine(quarantined_at);
+            """,
+        )
 
     def _migrate_schema_v1_current_connection(self) -> None:
         _execute_sql_script(
@@ -1080,6 +1101,7 @@ class BridgeStore:
             "telegram_new_threads",
             "manual_topic_threads",
             "processed_telegram_updates",
+            "telegram_update_quarantine",
         }
         present_tables = {
             str(row[0])
@@ -2021,6 +2043,51 @@ class BridgeStore:
                 )
                 """
             )
+
+    def quarantine_telegram_update(
+        self,
+        update_id: int,
+        *,
+        update_kind: str,
+        error_type: str,
+    ) -> None:
+        """Atomically skip one bad update without retaining message content."""
+
+        safe_kind = re.sub(r"[^a-z_]+", "_", update_kind.lower())[:40]
+        safe_type = re.sub(r"[^A-Za-z0-9_]+", "_", error_type)[:80]
+        now = utc_now()
+        with self.connection:
+            self.connection.execute(
+                """
+                INSERT OR IGNORE INTO telegram_update_quarantine(
+                    update_id, update_kind, error_type, quarantined_at
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (update_id, safe_kind or "unknown", safe_type or "Exception", now),
+            )
+            self.connection.execute(
+                """
+                INSERT OR IGNORE INTO processed_telegram_updates(
+                    update_id, processed_at
+                ) VALUES (?, ?)
+                """,
+                (update_id, now),
+            )
+            self.connection.execute(
+                """
+                DELETE FROM telegram_update_quarantine
+                WHERE update_id < (
+                    SELECT COALESCE(MAX(update_id), 0) - 100
+                    FROM telegram_update_quarantine
+                )
+                """
+            )
+
+    def telegram_update_quarantine_health(self) -> dict[str, int]:
+        row = self.connection.execute(
+            "SELECT COUNT(*) AS count FROM telegram_update_quarantine"
+        ).fetchone()
+        return {"quarantined": 0 if row is None else int(row["count"])}
 
     def initial_history_complete(self, thread_id: str) -> bool:
         return self.get_setting(f"initial_history_complete:{thread_id}") == "1"

@@ -72,6 +72,34 @@ def _is_side_effecting_method(method: str) -> bool:
     return method not in _READ_ONLY_METHODS
 
 
+def _response_payload(raw: Any, *, method: str) -> dict[str, Any]:
+    """Validate the object shape mandated by Telegram Bot API responses."""
+
+    if isinstance(raw, dict):
+        return raw
+    raise TelegramError(
+        f"{method}: malformed Telegram response",
+        method=method,
+        kind="protocol",
+        retryable=True,
+        outcome_ambiguous=_is_side_effecting_method(method),
+    )
+
+
+def _retry_after_seconds(payload: dict[str, Any]) -> int | None:
+    parameters = payload.get("parameters")
+    if not isinstance(parameters, dict):
+        return None
+    value = parameters.get("retry_after")
+    if isinstance(value, bool):
+        return None
+    try:
+        seconds = int(value)
+    except (TypeError, ValueError):
+        return None
+    return seconds if seconds > 0 else None
+
+
 def exponential_backoff_delay(
     attempt: int,
     *,
@@ -167,7 +195,10 @@ class TelegramAPI:
                 request, timeout=self._timeout_seconds
             ) as response:
                 try:
-                    payload = json.loads(response.read().decode("utf-8"))
+                    payload = _response_payload(
+                        json.loads(response.read().decode("utf-8")),
+                        method=method,
+                    )
                 except (UnicodeDecodeError, json.JSONDecodeError) as error:
                     raise TelegramError(
                         f"{method}: malformed Telegram response",
@@ -179,7 +210,10 @@ class TelegramAPI:
         except urllib.error.HTTPError as error:
             http_status = int(error.code)
             try:
-                payload = json.loads(error.read().decode("utf-8"))
+                payload = _response_payload(
+                    json.loads(error.read().decode("utf-8")),
+                    method=method,
+                )
             except Exception:
                 raise TelegramError(
                     f"{method}: Telegram HTTP {http_status}",
@@ -232,14 +266,13 @@ class TelegramAPI:
         if payload.get("ok"):
             return payload.get("result")
 
-        parameters = payload.get("parameters") or {}
-        retry_after = parameters.get("retry_after")
+        retry_after = _retry_after_seconds(payload)
         if retry_flood and retry_after:
-            time.sleep(min(int(retry_after) + 1, 65))
+            time.sleep(min(retry_after + 1, 65))
             return self.call(method, params, retry_flood=False)
 
         description = str(payload.get("description") or "Telegram API error")
-        retry_after_seconds = int(retry_after) if retry_after else None
+        retry_after_seconds = retry_after
         raise TelegramError(
             f"{method}: {description}",
             method=method,
@@ -310,7 +343,10 @@ class TelegramAPI:
                 request, timeout=self._timeout_seconds
             ) as response:
                 try:
-                    payload = json.loads(response.read().decode("utf-8"))
+                    payload = _response_payload(
+                        json.loads(response.read().decode("utf-8")),
+                        method=method,
+                    )
                 except (UnicodeDecodeError, json.JSONDecodeError) as error:
                     raise TelegramError(
                         f"{method}: malformed Telegram response",
@@ -322,7 +358,10 @@ class TelegramAPI:
         except urllib.error.HTTPError as error:
             http_status = int(error.code)
             try:
-                payload = json.loads(error.read().decode("utf-8"))
+                payload = _response_payload(
+                    json.loads(error.read().decode("utf-8")),
+                    method=method,
+                )
             except Exception:
                 raise TelegramError(
                     f"{method}: Telegram HTTP {http_status}",
@@ -364,15 +403,14 @@ class TelegramAPI:
             )
         if payload.get("ok"):
             return payload.get("result")
-        parameters = payload.get("parameters") or {}
-        retry_after = parameters.get("retry_after")
+        retry_after = _retry_after_seconds(payload)
         raise TelegramError(
             f"{method}: "
             f"{payload.get('description') or 'Telegram API error'}",
             method=method,
             kind="flood_wait" if retry_after else "api",
             retryable=retry_after is not None,
-            retry_after_seconds=int(retry_after) if retry_after else None,
+            retry_after_seconds=retry_after,
             http_status=http_status,
         )
 
@@ -402,7 +440,30 @@ class TelegramAPI:
         }
         if offset is not None:
             params["offset"] = offset
-        return list(self.call("getUpdates", params))
+        result = self.call("getUpdates", params)
+        if not isinstance(result, list):
+            raise TelegramError(
+                "getUpdates: malformed Telegram result",
+                method="getUpdates",
+                kind="protocol",
+                retryable=True,
+            )
+        updates: list[dict[str, Any]] = []
+        for update in result:
+            update_id = update.get("update_id") if isinstance(update, dict) else None
+            if (
+                isinstance(update_id, bool)
+                or not isinstance(update_id, int)
+                or update_id < 0
+            ):
+                raise TelegramError(
+                    "getUpdates: malformed Telegram update",
+                    method="getUpdates",
+                    kind="protocol",
+                    retryable=True,
+                )
+            updates.append(update)
+        return updates
 
     def get_file(self, file_id: str) -> dict[str, Any]:
         if not file_id:
